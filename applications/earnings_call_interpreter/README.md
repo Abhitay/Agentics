@@ -7,7 +7,7 @@ Analyzing earnings calls and financial filings is slow and error-prone. This pro
 
 ## Features
 
-- Natural language Q&A over earnings calls and 10-Q/10-K filings.
+- Natural language Q&A over earnings calls.
 - Automatic executive summaries of company performance.
 - Peer benchmarking and competitive analysis across industry verticals.
 - Streamlit UI for interactive exploration.

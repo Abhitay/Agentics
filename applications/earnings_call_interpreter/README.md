@@ -15,9 +15,9 @@ Analyzing earnings calls and financial filings is slow and error-prone. This pro
 ## Tech Stack
 
 - **Python**, **Streamlit**
-- **Vector DB**: e.g., Chroma / Qdrant / pgvector
-- **Knowledge Graph**: e.g., Neo4j / NetworkX
-- **LLM + Embeddings**: OpenAI or other provider
+- **Vector DB**: Chroma
+- **Knowledge Graph**: NetworkX
+- **LLM + Embeddings**: Gemini 2.5 Flash Lite
 
 ## Structure
 

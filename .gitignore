@@ -40,3 +40,100 @@ __*__/
 _[a-z]*.py
 invoke.json
 invoke.y*ml
+
+# --- OS files ---
+.DS_Store
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+*.egg
+.eggs/
+.env
+.venv/
+venv/
+ENV/
+env.bak/
+pip-wheel-metadata/
+
+# --- Jupyter ---
+.ipynb_checkpoints/
+
+# --- Logs ---
+*.log
+logs/
+logging/
+
+# --- IDE ---
+.vscode/
+.idea/
+.settings/
+*.swp
+
+# --- Environment + creds ---
+.env
+*.env
+secrets.json
+config/local_*.yaml
+*.pem
+*.key
+
+# --- Data folders (raw + embeddings + cache) ---
+data/chroma/
+data/processed/
+data/corpus/
+data/universe/
+data/**/*.parquet
+data/**/*.sqlite3
+data/**/*.bin
+data/**/link_lists.bin
+data/**/header.bin
+data/**/length.bin
+data/**/data_level0.bin
+
+# Keep only documentation about datasets
+!data/**/*.md
+
+# --- Model artifacts ---
+*.pt
+*.pth
+*.h5
+*.joblib
+*.pickle
+*.pkl
+*.npz
+*.npy
+
+# --- Vector stores / RAG indexes ---
+*.index
+*.faiss
+*.ann
+*.db
+
+# --- Cache ---
+__pycache__/
+.cache/
+.faiss/
+tmp/
+temp/
+
+# --- Build/dist ---
+dist/
+build/
+*.egg-info
+
+# --- UI ---
+streamlit_static/
+node_modules/
+
+# --- Project specific ---
+src/old_experiments/results/*
+src/old_experiments/**/*.parquet
+src/old_experiments/**/*.sqlite*
+src/old_experiments/**/*.bin
+
+# but keep source code
+!src/**/*.py
+

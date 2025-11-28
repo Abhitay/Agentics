@@ -17,6 +17,7 @@ import numpy as np
 import pandas as pd
 
 from src.config.settings import settings
+from src.utils.quarters import normalize_quarter  # ✅ keep quarter normalization in sync
 
 _client = chromadb.PersistentClient(path=settings.vector_db.persist_directory)
 _collection = None
@@ -102,27 +103,37 @@ def upsert_chunks(
             "metadata": {...}   # optional
         }
     We enrich metadata with company / filing_type / quarter.
+
+    🔧 IMPORTANT:
+    - Normalize company (upper-case).
+    - Normalize quarter using the same logic as metrics/summary
+      so that filters line up with UI & pipeline.
     """
     col = get_chroma_collection()
+
+    # Normalize company & quarter once here
+    company_norm = str(company).upper() if company else None
+    quarter_norm = (
+        normalize_quarter(None, None, quarter) if quarter is not None else None
+    )
 
     ids = []
     texts = []
     metadatas = []
 
     for i, ch in enumerate(chunks):
-        ids.append(f"{company}_{filing_type}_{quarter}_{i}")
+        ids.append(f"{company_norm}_{filing_type}_{quarter_norm}_{i}")
         texts.append(ch["text"])
 
         metadata = (ch.get("metadata") or {}).copy()
         metadata.update(
             {
-                "company": company,
+                "company": company_norm,
                 "filing_type": filing_type,
-                "quarter": quarter,
+                "quarter": quarter_norm,
             }
         )
 
-        # 🔧 NEW: sanitize all metadata values
         metadatas.append(_sanitize_metadata(metadata))
 
     if texts:
@@ -140,24 +151,37 @@ def hybrid_search(
     Run a semantic search over stored chunks.
 
     Uses Chroma's filter syntax with $and / $eq.
+
+    IMPORTANT:
+    - Normalize company & quarter same as in upsert.
+    - If no results are found with a specific quarter, fall back to
+      searching for the same company/filing_type across all quarters.
     """
     col = get_chroma_collection()
 
-    # Build filter clauses
-    clauses: List[Dict[str, Any]] = []
+    # Normalize inputs to match how we stored them
+    company_norm = str(company).upper() if company else None
+    quarter_norm = (
+        normalize_quarter(None, None, quarter) if quarter is not None else None
+    )
 
-    if company:
-        clauses.append({"company": {"$eq": company}})
-    if filing_type:
-        clauses.append({"filing_type": {"$eq": filing_type}})
-    if quarter:
-        clauses.append({"quarter": {"$eq": quarter}})
+    def _build_where(c: Optional[str], f: Optional[str], q: Optional[str]):
+        clauses: List[Dict[str, Any]] = []
+        if c:
+            clauses.append({"company": {"$eq": c}})
+        if f:
+            clauses.append({"filing_type": {"$eq": f}})
+        if q:
+            clauses.append({"quarter": {"$eq": q}})
 
-    where_expr: Optional[Dict[str, Any]] = None
-    if len(clauses) == 1:
-        where_expr = clauses[0]
-    elif len(clauses) > 1:
-        where_expr = {"$and": clauses}
+        if len(clauses) == 0:
+            return None
+        if len(clauses) == 1:
+            return clauses[0]
+        return {"$and": clauses}
+
+    # First pass: strict filter including quarter (if provided)
+    where_expr = _build_where(company_norm, filing_type, quarter_norm)
 
     res = col.query(
         query_texts=[query],
@@ -167,6 +191,18 @@ def hybrid_search(
 
     documents = res.get("documents", [[]])[0]
     metadatas = res.get("metadatas", [[]])[0]
+
+    # Fallback: if nothing found and we filtered by quarter,
+    # try again without the quarter restriction (same company & filing_type).
+    if (not documents) and quarter_norm is not None:
+        where_expr_loose = _build_where(company_norm, filing_type, None)
+        res = col.query(
+            query_texts=[query],
+            n_results=top_k,
+            where=where_expr_loose,
+        )
+        documents = res.get("documents", [[]])[0]
+        metadatas = res.get("metadatas", [[]])[0]
 
     results: List[Dict[str, Any]] = []
     for doc, meta in zip(documents, metadatas):

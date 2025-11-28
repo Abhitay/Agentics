@@ -5,6 +5,13 @@ from pathlib import Path
 import streamlit as st
 import pandas as pd
 
+# Optional: simple PDF generation for summaries
+try:
+    from fpdf import FPDF
+    HAS_FPDF = True
+except ImportError:
+    HAS_FPDF = False
+
 # Make sure project root is on sys.path
 ROOT_DIR = Path(__file__).resolve().parents[2]
 if str(ROOT_DIR) not in sys.path:
@@ -13,14 +20,148 @@ if str(ROOT_DIR) not in sys.path:
 UNIVERSE_PATH = ROOT_DIR / "data/universe/mapped_universe.parquet"
 STATEMENTS_PATH = ROOT_DIR / "data/processed/statements.parquet"
 
-from src.rag.pipeline import answer_question, generate_summary, benchmark_peers
+from src.rag.pipeline import (
+    answer_question,
+    generate_summary,
+    benchmark_peers,
+)
 from src.utils.quarters import normalize_quarter
 
 
 # --------------------------------------------------------------------
 # Helpers
 # --------------------------------------------------------------------
+def _sanitize_text_for_pdf(text: str) -> str:
+    """
+    Replace common Unicode punctuation with simpler ASCII versions so that
+    PDF generation using latin-1 encoding doesn't crash.
+    """
+    replacements = {
+        "\u2013": "-",  # en dash
+        "\u2014": "-",  # em dash
+        "\u2018": "'",  # left single quote
+        "\u2019": "'",  # right single quote
+        "\u201c": '"',  # left double quote
+        "\u201d": '"',  # right double quote
+        "\u2022": "-",  # bullet
+    }
+    for bad, good in replacements.items():
+        text = text.replace(bad, good)
+    return text
 
+
+def _create_summary_pdf(company: str, quarter: str, summary_md: str) -> bytes:
+    """
+    Very simple text-only PDF from the markdown summary.
+    Requires `fpdf` library to be installed.
+    """
+    if not HAS_FPDF:
+        return b""
+
+    summary_md = _sanitize_text_for_pdf(summary_md)
+
+    pdf = FPDF()
+    pdf.set_auto_page_break(auto=True, margin=15)
+    pdf.add_page()
+    pdf.set_font("Arial", size=12)
+
+    title = f"Earnings Summary - {company} {quarter}"
+    pdf.multi_cell(0, 10, title)
+    pdf.ln(5)
+
+    # Strip markdown headings for PDF
+    text = summary_md.replace("## ", "").replace("### ", "")
+    for line in text.split("\n"):
+        line = _sanitize_text_for_pdf(line)
+        pdf.multi_cell(0, 8, line)
+
+    # FPDF returns a str in Python3; encode safely
+    out = pdf.output(dest="S")
+    if isinstance(out, bytes):
+        return out
+    return out.encode("latin-1", "replace")
+
+
+def _render_summary_analytics(company: str, quarter: str, analytics: dict):
+    """
+    Render the overview for the summary tab:
+    - sentiment bar
+    - guidance chip
+    - risk level chip
+    - focus segments
+    """
+    sentiment = analytics.get("sentiment", {}) or {}
+    guidance = analytics.get("guidance", {}) or {}
+    risk = analytics.get("risk", {}) or {}
+    focus_segments = analytics.get("focus_segments", []) or []
+
+    sentiment_label = sentiment.get("label", "Mixed")
+    pos = float(sentiment.get("positive", 0.33) or 0.33)
+    neu = float(sentiment.get("neutral", 0.34) or 0.34)
+    neg = float(sentiment.get("negative", 0.33) or 0.33)
+
+    guidance_label = guidance.get("label", "None")
+    risk_level = risk.get("level", "Medium")
+    top_risks = risk.get("top_risks", []) or []
+
+    st.markdown(f"### {company} · {quarter}")
+
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.metric("Overall tone", sentiment_label)
+    with col2:
+        st.metric("Guidance vs expectations", guidance_label)
+    with col3:
+        st.metric("Risk level", risk_level)
+
+    # Sentiment bar
+    sentiment_df = pd.DataFrame(
+        {
+            "Sentiment": ["Positive", "Neutral", "Negative"],
+            "Score": [pos, neu, neg],
+        }
+    ).set_index("Sentiment")
+    st.markdown("**How did the call feel overall?**")
+    st.bar_chart(sentiment_df)
+
+    # Focus segments
+    if focus_segments:
+        st.markdown("**What management focused on**")
+        st.markdown(" · ".join(focus_segments))
+
+    # Top risks
+    if top_risks:
+        st.markdown("**Main risks they talked about**")
+        st.markdown(" · ".join(top_risks))
+
+
+def _render_evidence_snippets(sources):
+    """
+    Show short snippets as quick evidence for the Q&A answer.
+    If there are no transcript chunks, at least tell the user what we used.
+    """
+    st.markdown("### Why this answer?")
+
+    if not sources:
+        st.caption(
+            "This answer comes from structured numbers extracted from the filing. "
+            "No direct transcript excerpts were available for this question."
+        )
+        return
+
+    max_snippets = 3
+    for i, src in enumerate(sources[:max_snippets], start=1):
+        text = src.get("text", "") or ""
+        meta = src.get("metadata", {}) or {}
+        snippet = text.strip()
+        if len(snippet) > 350:
+            snippet = snippet[:350].rstrip() + "…"
+
+        meta_str = ", ".join(f"{k}: {v}" for k, v in meta.items()) if meta else ""
+        st.markdown(f"**Excerpt {i}**")
+        st.markdown(f"> {snippet}")
+        if meta_str:
+            st.caption(meta_str)
 
 
 # --------------------------------------------------------------------
@@ -36,6 +177,7 @@ if "ticker" not in universe_df.columns:
 if "name" not in universe_df.columns:
     raise ValueError("Expected 'name' column in mapped_universe.parquet")
 
+universe_df["ticker"] = universe_df["ticker"].astype(str).str.upper()
 universe_df["label"] = universe_df["ticker"] + " – " + universe_df["name"]
 
 # Map companyid -> ticker (float to match statements.parquet company_id)
@@ -53,11 +195,10 @@ if STATEMENTS_PATH.exists():
     # Map company_id to ticker using mapped_universe
     statements_df["ticker"] = statements_df["company_id"].map(companyid_to_ticker)
 
-    # Normalize quarter string
-    statements_df["quarter_str"] = [
-        normalize_quarter(row.call_year, row.call_quarter, row.call_period)
-        for row in statements_df.itertuples(index=False)
-    ]
+    # Normalize quarter string in the SAME way as the RAG pipeline
+    statements_df["quarter_str"] = statements_df["call_period"].apply(
+        lambda cp: normalize_quarter(None, None, cp)
+    )
 
     # Drop rows without ticker or quarter
     statements_df = statements_df.dropna(subset=["ticker", "quarter_str"])
@@ -71,8 +212,8 @@ if STATEMENTS_PATH.exists():
 else:
     AVAILABLE_QUARTERS = {}
 
-# Optional: if you want to only show companies that actually have data
-# universe_df = universe_df[universe_df["ticker"].isin(AVAILABLE_QUARTERS.keys())].copy()
+# Only show companies that actually have earnings call data
+universe_df = universe_df[universe_df["ticker"].isin(AVAILABLE_QUARTERS.keys())].copy()
 
 
 # --------------------------------------------------------------------
@@ -84,7 +225,6 @@ st.set_page_config(
 )
 
 st.title("📈 Earnings Call RAG Analyst")
-
 
 with st.sidebar:
     st.header("Settings")
@@ -100,7 +240,6 @@ with st.sidebar:
     company = selected_row["ticker"]                # used in queries
     company_id = float(selected_row["companyid"])   # if you later need it
 
-
     # Quarter dropdown driven by AVAILABLE_QUARTERS
     available_q = AVAILABLE_QUARTERS.get(company, [])
 
@@ -112,13 +251,12 @@ with st.sidebar:
 
     temperature = st.slider("LLM temperature", 0.0, 1.0, 0.2, 0.05)
 
-
 tab_qna, tab_summary, tab_benchmark = st.tabs(
     ["🔍 Q&A", "📝 Executive Summary", "⚔️ Peer Benchmarking"]
 )
 
-
 filing_type = "Earnings Call"  # currently only supporting earnings calls
+
 # --------------------------------------------------------------------
 # Q&A tab
 # --------------------------------------------------------------------
@@ -127,7 +265,7 @@ with tab_qna:
 
     question = st.text_area(
         "Question",
-        placeholder="e.g. What did management say about revenue guidance?",
+        placeholder="e.g. What was total revenue? Did they raise or cut guidance?",
         height=120,
     )
 
@@ -149,8 +287,12 @@ with tab_qna:
             st.markdown("### Answer")
             st.write(answer)
 
+            # Human-friendly evidence
+            _render_evidence_snippets(sources)
+
+            # Full raw sources (for power users)
             if sources:
-                st.markdown("### Sources")
+                st.markdown("### All source chunks")
                 for i, src in enumerate(sources, start=1):
                     with st.expander(f"Source {i}"):
                         st.write(src.get("text", ""))
@@ -160,7 +302,7 @@ with tab_qna:
 
 
 # --------------------------------------------------------------------
-# Summary tab
+# Summary tab – user-friendly + analytics + PDF, no raw metric tables
 # --------------------------------------------------------------------
 with tab_summary:
     st.subheader("Generate an executive summary")
@@ -171,8 +313,8 @@ with tab_summary:
         if quarter is None:
             st.error("No earnings call data available for this company/period.")
         else:
-            with st.spinner("Summarizing company performance..."):
-                summary, sources = generate_summary(
+            with st.spinner("Summarizing company performance in plain English..."):
+                summary, sources, analytics = generate_summary(
                     company=company,
                     filing_type=filing_type,
                     quarter=quarter,
@@ -180,54 +322,73 @@ with tab_summary:
                     compare_previous=compare_prev,
                 )
 
+            # Overview + sentiment/guidance/risk/focus
+            _render_summary_analytics(company, quarter, analytics or {})
+
             st.markdown("### Summary")
             st.markdown(summary)
 
+            # Download as PDF
+            if HAS_FPDF:
+                pdf_bytes = _create_summary_pdf(company, quarter, summary)
+                if pdf_bytes:
+                    st.download_button(
+                        label="📥 Download summary as PDF",
+                        data=pdf_bytes,
+                        file_name=f"{company}_{quarter}_summary.pdf",
+                        mime="application/pdf",
+                    )
+            else:
+                st.caption(
+                    "Install `fpdf` (`pip install fpdf`) to enable PDF downloads."
+                )
+
+            # Vector sources (if you want to inspect what fed the summary)
             if sources:
-                st.markdown("### Sources")
+                st.markdown("### Source snippets used for summary")
                 for i, src in enumerate(sources, start=1):
                     with st.expander(f"Source {i}"):
                         st.write(src.get("text", ""))
                         st.caption(str(src.get("metadata", {})))
 
 
-
 # --------------------------------------------------------------------
-# Peer benchmarking tab
+# Peer benchmarking tab – multiselect peers, simple language
 # --------------------------------------------------------------------
 with tab_benchmark:
     st.subheader("Peer benchmarking")
 
-    peers_input = st.text_input(
-        "Peer tickers (comma-separated)", value="MSFT, GOOGL, AMZN"
+    # Build list of peer labels (exclude the base company)
+    all_labels = universe_df["label"].tolist()
+    peer_labels = [lbl for lbl in all_labels if lbl != selected_label]
+
+    selected_peer_labels = st.multiselect(
+        "Peer companies",
+        peer_labels,
+        default=peer_labels[:3] if len(peer_labels) >= 3 else peer_labels,
+        help="Pick a few similar companies to compare against.",
     )
 
-    metric = st.text_input(
-        "Metric to compare",
-        value="Revenue growth",
-        placeholder="e.g. Operating margin, EPS growth, cloud revenue",
-    )
+    # Map labels -> tickers
+    peer_tickers = []
+    for lbl in selected_peer_labels:
+        row = universe_df[universe_df["label"] == lbl].iloc[0]
+        peer_tickers.append(str(row["ticker"]).upper())
 
     if st.button("Run benchmarking"):
-        peers = [p.strip() for p in peers_input.split(",") if p.strip()]
-        if not peers or not metric.strip():
-            st.warning("Please enter peers and a metric.")
+        if not peer_tickers:
+            st.warning("Please select at least one peer company.")
         elif quarter is None:
             st.error("No earnings call data available for this company/period.")
         else:
-            with st.spinner("Comparing peers..."):
-                result, table = benchmark_peers(
+            with st.spinner("Comparing companies in simple language..."):
+                result, _ = benchmark_peers(
                     base_company=company,
-                    peers=peers,
-                    metric=metric,
+                    peers=peer_tickers,
                     filing_type=filing_type,
                     quarter=quarter,
                     temperature=temperature,
                 )
 
-            st.markdown("### Benchmarking Insight")
+            st.markdown("### What stands out vs peers")
             st.write(result)
-
-            if table is not None:
-                st.markdown("### Comparison Table")
-                st.dataframe(table)

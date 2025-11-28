@@ -2,8 +2,9 @@ import os
 import sys
 import time
 import uuid
+import ast
 from pathlib import Path
-from typing import List, Literal, Tuple, Set
+from typing import List, Literal, Set
 
 import pandas as pd
 from dotenv import load_dotenv
@@ -36,8 +37,8 @@ CHECKPOINT_FILE = PROCESSED_DIR / "checkpoint_processed_ids.txt"
 
 # ~14 calls/min → 60 / 4.5
 PER_CALL_SLEEP_SECONDS = 4.5
-BATCH_SIZE = 20  # how many statements to buffer before writing
-
+# We now flush to parquet after every statement for simplicity
+BATCH_SIZE = 1
 
 # -------------------------------------------------
 # 1. Gemini client + model config
@@ -47,7 +48,6 @@ client = genai.Client()  # uses GEMINI_API_KEY
 
 MODEL = "gemini-2.5-flash-lite"
 TEMPERATURE = 0.0
-
 
 # -------------------------------------------------
 # 2. Pydantic schemas
@@ -114,12 +114,52 @@ You read earnings call statements and extract metrics, guidance, risks, and busi
 
 Return ONLY JSON (no prose) that exactly matches the provided JSON schema.
 Respect all enum values strictly. Use null or "unknown" where appropriate.
+
+Constraints:
+- evidence_span must be a SHORT direct quote from the statement, at most 200 characters.
+- context must be a SHORT paraphrase, at most 300 characters.
+- Do NOT repeat the same sentence or phrase more than once.
+- Do NOT include the full statement text in evidence_span or context.
 """
 
 
 # -------------------------------------------------
 # 3. Gemini call with rate-limit + quota handling
 # -------------------------------------------------
+
+def _extract_error_payload(exc: Exception) -> dict | None:
+    """
+    Try to robustly pull a JSON/dict error payload out of ClientError/ServerError.
+    The google client sometimes gives:
+      - a dict with 'error'
+      - or a string like "429 RESOURCE_EXHAUSTED. {'error': {...}}"
+    """
+    if not exc.args:
+        return None
+
+    arg0 = exc.args[0]
+
+    # Direct dict
+    if isinstance(arg0, dict) and "error" in arg0:
+        return arg0.get("error")
+
+    # Try to parse dict embedded in a string
+    try:
+        s = str(arg0)
+        first_brace = s.find("{")
+        if first_brace != -1:
+            maybe_dict = ast.literal_eval(s[first_brace:])
+            if isinstance(maybe_dict, dict):
+                # sometimes the dict itself is {"error": {...}}
+                if "error" in maybe_dict and isinstance(maybe_dict["error"], dict):
+                    return maybe_dict["error"]
+                # or the dict IS the error payload
+                return maybe_dict
+    except Exception:
+        pass
+
+    return None
+
 
 def _parse_quota_info(err_payload: dict) -> tuple[int | None, float | None, bool]:
     """
@@ -142,6 +182,7 @@ def _parse_quota_info(err_payload: dict) -> tuple[int | None, float | None, bool
             violations = d.get("violations", []) or []
             for v in violations:
                 quota_id = v.get("quotaId", "")
+                # Daily limit (what you're hitting: GenerateRequestsPerDayPerProjectPerModel-FreeTier)
                 if "GenerateRequestsPerDayPerProjectPerModel" in quota_id:
                     is_daily = True
 
@@ -155,7 +196,6 @@ def call_gemini(prompt: str, max_retries: int = 8, base_backoff: float = 5.0) ->
     - 429 DAILY QUOTA → raise RuntimeError("DAILY_QUOTA_EXCEEDED")
     - 503 → exponential backoff
     """
-
     attempt = 0
     while attempt <= max_retries:
         try:
@@ -172,12 +212,7 @@ def call_gemini(prompt: str, max_retries: int = 8, base_backoff: float = 5.0) ->
             return response.text
 
         except (ClientError, ServerError) as e:
-            # The google library usually stuffs the JSON under e.args[0]["error"]
-            err_payload = None
-            if e.args:
-                arg0 = e.args[0]
-                if isinstance(arg0, dict) and "error" in arg0:
-                    err_payload = arg0["error"]
+            err_payload = _extract_error_payload(e)
 
             if isinstance(err_payload, dict):
                 err_code, retry_seconds, is_daily = _parse_quota_info(err_payload)
@@ -188,11 +223,14 @@ def call_gemini(prompt: str, max_retries: int = 8, base_backoff: float = 5.0) ->
                     print(f"[DAILY QUOTA EXCEEDED] {msg}")
                     raise RuntimeError("DAILY_QUOTA_EXCEEDED")
 
-                # PER-MINUTE 429
+                # PER-MINUTE 429 (rate limit)
                 if err_code == 429:
                     attempt += 1
                     delay = retry_seconds or (base_backoff * attempt)
-                    print(f"[429] Rate limit hit. Sleeping {delay:.2f}s (attempt {attempt}/{max_retries})...")
+                    print(
+                        f"[429] Rate limit hit. Sleeping {delay:.2f}s "
+                        f"(attempt {attempt}/{max_retries})..."
+                    )
                     time.sleep(delay)
                     continue
 
@@ -200,7 +238,10 @@ def call_gemini(prompt: str, max_retries: int = 8, base_backoff: float = 5.0) ->
                 if err_code == 503:
                     attempt += 1
                     delay = base_backoff * attempt
-                    print(f"[503] Server busy. Backoff {delay:.2f}s (attempt {attempt}/{max_retries})...")
+                    print(
+                        f"[503] Server busy. Backoff {delay:.2f}s "
+                        f"(attempt {attempt}/{max_retries})..."
+                    )
                     time.sleep(delay)
                     continue
 
@@ -215,10 +256,34 @@ def call_gemini(prompt: str, max_retries: int = 8, base_backoff: float = 5.0) ->
 # -------------------------------------------------
 
 def load_checkpoint() -> Set[str]:
-    if not CHECKPOINT_FILE.exists():
-        return set()
-    with open(CHECKPOINT_FILE, "r") as f:
-        return set(line.strip() for line in f if line.strip())
+    """
+    Load processed statement_ids from:
+    1) checkpoint file if present
+    2) otherwise, reconstruct from STATEMENTS_PATH (if it exists)
+    """
+    processed: Set[str] = set()
+
+    # 1) From checkpoint file
+    if CHECKPOINT_FILE.exists():
+        with open(CHECKPOINT_FILE, "r") as f:
+            processed = {line.strip() for line in f if line.strip()}
+
+    # 2) If no checkpoint but we already have statements.parquet, rebuild
+    if not processed and STATEMENTS_PATH.exists():
+        try:
+            existing = pd.read_parquet(STATEMENTS_PATH, columns=["statement_id"])
+            processed = set(existing["statement_id"].astype(str).tolist())
+            # Optionally re-write checkpoint file for future fast loads
+            CHECKPOINT_FILE.parent.mkdir(parents=True, exist_ok=True)
+            with open(CHECKPOINT_FILE, "w") as f:
+                for sid in sorted(processed):
+                    f.write(str(sid) + "\n")
+        except Exception as e:
+            print(f"[WARN] Failed to rebuild checkpoint from {STATEMENTS_PATH}: {e}")
+
+    print(f"Checkpoint file: {CHECKPOINT_FILE}")
+    print(f"Loaded {len(processed)} processed statement_ids from checkpoint.")
+    return processed
 
 
 def append_checkpoint(statement_id: str):
@@ -270,6 +335,7 @@ def load_corpus_2025_top20() -> pd.DataFrame:
     ].copy()
     after = len(call_section)
 
+    print(f"Using corpus: {CORPUS_PATH}")
     print(f"Corpus rows before filter: {before}")
     print(f"Corpus rows after  2025 + top-20 filter: {after}")
 
@@ -348,8 +414,58 @@ def extract_group(subset: pd.DataFrame, processed_ids: Set[str]):
 
         try:
             prompt = build_prompt(row)
-            response_text = call_gemini(prompt)
-            data = ExtractionResponse.model_validate_json(response_text)
+
+            # --------------------------------------------
+            # SAFETY: JSON validation + salvage loop
+            # --------------------------------------------
+            attempts = 0
+            max_attempts = 3
+
+            while True:
+                response_text = call_gemini(prompt)
+
+                try:
+                    # First, try parsing as-is
+                    data = ExtractionResponse.model_validate_json(response_text)
+                    break
+                except Exception:
+                    attempts += 1
+                    print(
+                        f"[WARN] Bad JSON for statement {statement_id}. "
+                        f"Attempt {attempts}/{max_attempts}"
+                    )
+                    print("--- RAW TEXT START ---")
+                    print(response_text[:2000])
+                    print("--- RAW TEXT END ---")
+
+                    # If braces are unbalanced, try trimming at last closing brace
+                    if response_text.count("{") != response_text.count("}"):
+                        print(
+                            "[HINT] JSON looks truncated (brace mismatch). "
+                            "Trying to trim at last '}'..."
+                        )
+                        last_brace = response_text.rfind("}")
+                        if last_brace != -1:
+                            trimmed = response_text[: last_brace + 1]
+                            try:
+                                data = ExtractionResponse.model_validate_json(trimmed)
+                                print("[INFO] Successfully parsed after trimming.")
+                                break
+                            except Exception:
+                                print("[INFO] Trimmed JSON still invalid.")
+
+                    if attempts >= max_attempts:
+                        # give up on this statement; proceed with empty extraction
+                        print(
+                            "[ERROR] JSON broken permanently for this statement. "
+                            "Proceeding with empty ExtractionResponse()."
+                        )
+                        data = ExtractionResponse()  # empty/default
+                        break
+
+                    # small wait before retrying the LLM
+                    time.sleep(1.5)
+                    continue
 
             # -------------------
             # Statement row
@@ -446,11 +562,11 @@ def extract_group(subset: pd.DataFrame, processed_ids: Set[str]):
                     }
                 )
 
-            # mark checkpoint AFTER everything succeeded
+            # mark checkpoint AFTER everything succeeded for this statement
             append_checkpoint(statement_id)
             processed_ids.add(statement_id)
 
-            # flush batch periodically
+            # flush batch (BATCH_SIZE = 1, so this is effectively per-statement)
             if len(statement_rows) >= BATCH_SIZE:
                 flush_batch()
 
@@ -467,7 +583,7 @@ def extract_group(subset: pd.DataFrame, processed_ids: Set[str]):
             raise
 
         except Exception as e:
-            # Non-fatal: log and continue
+            # Non-fatal: log and continue (no checkpoint → will retry on next run)
             print(
                 f"[ERROR] Statement {statement_id} on Call {call_id} "
                 f"for Company {cid}: {e}"
@@ -485,13 +601,13 @@ def extract_group(subset: pd.DataFrame, processed_ids: Set[str]):
 def main():
     PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
 
-    print(f"Using corpus: {CORPUS_PATH}")
     call_section = load_corpus_2025_top20()
 
-    groups = call_section.groupby(["companyid", "company_name", "call_year", "call_quarter"])
+    groups = call_section.groupby(
+        ["companyid", "company_name", "call_year", "call_quarter"]
+    )
 
     processed_ids = load_checkpoint()
-    print(f"Loaded {len(processed_ids)} processed statement_ids from checkpoint.")
 
     for (cid, cname, year, quarter), subset in groups:
         label = f"{cname} (id={cid}) {year}{quarter}"
@@ -511,8 +627,10 @@ def main():
                 "\n[HALT] Fatal error during extraction "
                 f"for {label}: {e}"
             )
-            print("Flushed current batch. You can rerun this script later; "
-                  "it will resume from the last checkpoint.")
+            print(
+                "Flushed current batch. You can rerun this script later; "
+                "it will resume from the last checkpoint."
+            )
             break
 
     print("\n✅ Rebuild complete up to last successful checkpoint.")

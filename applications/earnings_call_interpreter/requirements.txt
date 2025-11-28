@@ -17,3 +17,4 @@ tabulate
 google-genai
 wrds
 ollama
+fpdf

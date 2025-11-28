@@ -140,7 +140,7 @@ def _load_risks_df() -> pd.DataFrame:
 
 
 # --------------------------------------------------------------------
-# Metrics / segments / risks helpers
+# Metrics / segments / risks helpers (exported for UI)
 # --------------------------------------------------------------------
 def get_company_quarter_metrics(company: str, quarter: str) -> pd.DataFrame:
     metrics = _load_metrics_df()
@@ -205,7 +205,7 @@ def get_company_quarter_risks(company: str, quarter: str) -> pd.DataFrame:
 
 
 # --------------------------------------------------------------------
-# Q&A – unchanged logic, still vector-only for now
+# Q&A – vector + structured metrics
 # --------------------------------------------------------------------
 def answer_question(
     question: str,
@@ -217,11 +217,17 @@ def answer_question(
     """
     Main Q&A entrypoint.
 
-    For now:
-    - Only uses vector search (Chroma) to fetch context.
-    - No external graph database.
+    Uses BOTH:
+    - Vector search (transcript snippets) for qualitative/contextual answers.
+    - Structured metrics/segments/risks for numeric facts (revenue, EPS, margins, etc.).
+
+    If a requested number is in the structured data, the model should use that.
+    If it's not available anywhere, it should explicitly say so.
     """
-    # 1. Retrieve from vector store
+    if quarter is None:
+        return "No quarter selected.", []
+
+    # 1) Retrieve transcript context from vector store
     vec_results = hybrid_search(
         query=question,
         company=company,
@@ -230,36 +236,201 @@ def answer_question(
         top_k=8,
     )
 
-    # 2. Build context string
     if vec_results:
-        context = "\n\n---\n\n".join([r["text"] for r in vec_results])
+        context = "\n\n---\n\n".join([r.get("text", "") for r in vec_results])
     else:
-        context = "NO CONTEXT AVAILABLE"
+        context = "NO TRANSCRIPT CONTEXT AVAILABLE"
 
-    # 3. Build prompt
+    # 2) Structured data for this company/quarter
+    current_metrics_df = get_company_quarter_metrics(company, quarter)
+    if not current_metrics_df.empty:
+        metric_cols = [
+            "metric_name",
+            "metric_category",
+            "metric_value",
+            "metric_value_type",
+            "metric_unit",
+            "metric_currency",
+            "metric_direction",
+            "metric_is_guidance",
+            "metric_period",
+            "metric_certainty",
+            "metric_context",
+        ]
+        metric_cols = [c for c in metric_cols if c in current_metrics_df.columns]
+        current_metrics_json = current_metrics_df[metric_cols].to_dict(orient="records")
+    else:
+        current_metrics_json = []
+
+    segments_df = get_company_quarter_segments(company, quarter)
+    if not segments_df.empty:
+        seg_cols = [
+            "segment_name",
+            "segment_direction",
+            "segment_is_guidance",
+            "segment_certainty",
+            "segment_context",
+        ]
+        seg_cols = [c for c in seg_cols if c in segments_df.columns]
+        segments_json = segments_df[seg_cols].to_dict(orient="records")
+    else:
+        segments_json = []
+
+    risks_df = get_company_quarter_risks(company, quarter)
+    if not risks_df.empty:
+        risk_cols = [
+            "risk_type",
+            "risk_sentiment",
+            "risk_severity",
+            "risk_certainty",
+            "risk_context",
+        ]
+        risk_cols = [c for c in risk_cols if c in risks_df.columns]
+        risks_json = risks_df[risk_cols].to_dict(orient="records")
+    else:
+        risks_json = []
+
+    structured = {
+        "company": company,
+        "quarter": quarter,
+        "metrics": current_metrics_json,
+        "segments": segments_json,
+        "risks": risks_json,
+    }
+    structured_json_str = json.dumps(structured, indent=2)
+
     prompt = f"""
-You are a senior equity research analyst.
+You are a helpful equity research assistant answering a question about
+{company} in {quarter}.
 
-Use ONLY the context from earnings filings below to answer the user's question.
-If something is not supported by the context, say so explicitly.
+Your audience is a smart person with little or no finance background.
+Explain things in simple language. Avoid heavy jargon. If you must use
+a finance term (like "margin" or "guidance"), briefly explain it in
+plain English.
 
-Context:
+You have TWO sources of evidence:
+
+1) Structured JSON with extracted metrics, segments and risks.
+   - Use this for all NUMERIC facts (e.g., revenue, profit, growth).
+   - If the user asks for a specific number (like "What is the revenue?"),
+     look for a relevant metric_name/metric_category first.
+   - If multiple related metrics exist (e.g. actual vs guidance), explain clearly.
+
+2) Transcript context from the earnings call.
+   - Use this for qualitative color, commentary, drivers, and explanations.
+   - If something is not clearly supported by either structured data or transcripts,
+     say you don't have that information.
+
+If you cannot find the requested numeric value in the structured data,
+DO NOT invent a number. Instead, say that the exact figure is not available
+in your extracted metrics, and you can only speak qualitatively if the
+transcript provides hints.
+
+Structured data (JSON):
+{structured_json_str}
+
+Transcript context:
 {context}
 
-Question: {question}
+User question:
+{question}
 
-Answer in a concise, well-structured way and clearly state any uncertainty.
+Now provide a short, clear answer (2–6 sentences). Use plain English,
+and imagine you are explaining it to a friend who owns the stock but
+is not a finance professional.
 """
 
-    # 4. Call Gemini
     answer = _call_llm(prompt, temperature=temperature)
-
-    # 5. Return answer + vector sources
     return answer, vec_results
 
 
 # --------------------------------------------------------------------
-# Executive summary – structured + metrics-aware
+# Analytics helper for summary (sentiment, guidance, risk, focus)
+# --------------------------------------------------------------------
+def _analyze_call_analytics(
+    structured_json_str: str,
+    context: str,
+) -> Dict[str, Any]:
+    """
+    Ask the LLM to produce high-level analytics for the summary tab:
+    - sentiment (positive/neutral/negative + label)
+    - guidance stance
+    - risk level and top risks
+    - focus segments
+
+    Returns a dict with sensible defaults if parsing fails.
+    """
+    analytics_prompt = f"""
+You are an equity research assistant.
+
+You are given structured data and earnings call context for a single
+quarter of a public company. Based on this, produce a JSON object that
+summarizes high-level "soft metrics" for a simple investor UI.
+
+The user is NOT a finance expert, so when you choose labels, prefer
+plain-language descriptions like "cautiously positive".
+
+Return ONLY valid JSON, no extra commentary, with this exact shape:
+
+{{
+  "sentiment": {{
+    "positive": float,   // between 0 and 1
+    "neutral": float,    // between 0 and 1
+    "negative": float,   // between 0 and 1
+    "label": string      // e.g. "Cautiously positive"
+  }},
+  "guidance": {{
+    "label": string      // one of ["Raised", "In-line", "Lowered", "None"]
+  }},
+  "risk": {{
+    "level": string,     // one of ["Low", "Medium", "High"]
+    "top_risks": [string, ...]  // up to 3 short risk themes
+  }},
+  "focus_segments": [string, ...]  // up to 3 key segments/products
+}}
+
+If you are uncertain, choose the closest label and keep the JSON valid.
+
+Structured data:
+{structured_json_str}
+
+Earnings call context:
+{context}
+"""
+
+    raw = _call_llm(analytics_prompt, temperature=0.1)
+
+    default_analytics: Dict[str, Any] = {
+        "sentiment": {
+            "positive": 0.33,
+            "neutral": 0.34,
+            "negative": 0.33,
+            "label": "Mixed",
+        },
+        "guidance": {"label": "None"},
+        "risk": {"level": "Medium", "top_risks": []},
+        "focus_segments": [],
+    }
+
+    try:
+        parsed = json.loads(raw)
+        # Basic sanity for sentiment numbers
+        sentiment = parsed.get("sentiment", {})
+        if isinstance(sentiment, dict):
+            for key in ["positive", "neutral", "negative"]:
+                if key in sentiment:
+                    try:
+                        sentiment[key] = float(sentiment[key])
+                    except Exception:
+                        sentiment[key] = default_analytics["sentiment"][key]
+        default_analytics.update(parsed)
+        return default_analytics
+    except Exception:
+        return default_analytics
+
+
+# --------------------------------------------------------------------
+# Executive summary – structured + metrics-aware + analytics
 # --------------------------------------------------------------------
 def generate_summary(
     company: str,
@@ -267,7 +438,7 @@ def generate_summary(
     quarter: Optional[str],
     temperature: float = 0.2,
     compare_previous: bool = True,
-) -> Tuple[str, List[Dict[str, Any]]]:
+) -> Tuple[str, List[Dict[str, Any]], Dict[str, Any]]:
     """
     Generate an executive summary of the company's earnings call.
 
@@ -275,9 +446,10 @@ def generate_summary(
     - Vector search over call statements for narrative context.
     - Structured metrics for this quarter (+ previous quarter if available).
     - Segments and risks tables for extra color.
+    - LLM-based analytics (sentiment, guidance stance, risk, focus segments).
     """
     if quarter is None:
-        return "No quarter selected.", []
+        return "No quarter selected.", [], {}
 
     # 1) Vector context from earnings call
     vec_results = hybrid_search(
@@ -304,6 +476,7 @@ def generate_summary(
             "metric_is_guidance",
             "metric_period",
         ]
+        cols = [c for c in cols if c in current_metrics_df.columns]
         current_metrics_json = current_metrics_df[cols].to_dict(orient="records")
     else:
         current_metrics_json = []
@@ -327,6 +500,7 @@ def generate_summary(
                     "metric_is_guidance",
                     "metric_period",
                 ]
+                cols = [c for c in cols if c in prev_df.columns]
                 prev_metrics_json = prev_df[cols].to_dict(orient="records")
 
     # 4) Segments & risks
@@ -372,19 +546,27 @@ def generate_summary(
 
     structured_json_str = json.dumps(structured, indent=2)
 
-    prompt = f"""
-You are an equity research analyst writing an executive summary
-for an investor who follows {company}.
+    # 5) Analytics for UI (sentiment, guidance, risk, focus)
+    analytics = _analyze_call_analytics(structured_json_str, context)
+
+    summary_prompt = f"""
+You are an equity research analyst writing a short summary
+for a regular investor who follows {company}.
+
+The reader is smart but NOT a finance expert. Use simple language,
+avoid jargon, and keep each bullet easy to understand. If you use a
+finance term (like "margin" or "guidance"), briefly explain it.
 
 You are given:
 1) Structured JSON with metrics, segments, and risks for the current quarter
    and, if available, the previous quarter.
 2) Text context from the earnings call.
 
-- Use the JSON for all NUMBERS (growth rates, margins, guidance vs actual).
-- Use the text context for explanations, color, and qualitative commentary.
-- If previous quarter data is available, explicitly compare vs previous quarter.
-- If some metrics are missing, acknowledge that briefly.
+- Use the JSON for all NUMBERS (revenue, profit, growth, etc.).
+- Use the text context for explanations, color, and simple storytelling.
+- If previous quarter data is available, clearly say whether things are
+  better, worse, or roughly the same.
+- If some metrics are missing, say that the data isn't available.
 
 Structured data (JSON):
 {structured_json_str}
@@ -397,73 +579,48 @@ Write a markdown summary with the following sections:
 ## Snapshot – {company} {quarter}
 
 ### Key Numbers
-- Bullet points with the most important metrics (revenue, EPS, key margins, growth).
+- 3–5 bullets with the most important numbers (explain what each number means).
 
 ### What Changed vs Previous Quarter
-- If previous quarter metrics are available, describe the main changes (growth/decline).
-- If not available, say that prior-quarter data is not available.
+- 2–4 bullets describing whether things got better, worse, or stayed similar.
 
 ### Segment Performance
-- Call out performance of key segments (from segments JSON) and any notable trends.
+- 2–4 bullets on which parts of the business did well or struggled
+  (e.g., iPhone, services, cloud, ads).
 
 ### Guidance & Outlook
-- Summarize forward-looking commentary and guidance (from metrics + context).
+- 2–4 bullets on what management expects for the next few quarters
+  (use plain language like "expecting solid growth" rather than jargon).
 
 ### Risks & Watchpoints
-- Highlight the most important risks (from risks JSON + context).
+- 2–4 bullets on the main risks or concerns an everyday investor should watch.
 
-Keep the tone concise and professional (3–6 bullets per section).
-If there are contradictions between JSON and text, trust the JSON and note the discrepancy.
+Keep the whole summary fairly short (around 250–400 words).
+Use simple, clear sentences and avoid long paragraphs.
 """
 
-    summary = _call_llm(prompt, temperature=temperature)
-    return summary, vec_results
+    summary = _call_llm(summary_prompt, temperature=temperature)
+    return summary, vec_results, analytics
 
 
 # --------------------------------------------------------------------
-# Peer benchmarking – metrics-based
+# Peer benchmarking – overall, simple language
 # --------------------------------------------------------------------
-def _filter_metrics_for_text(df: pd.DataFrame, metric_text: str) -> pd.DataFrame:
-    """
-    Filter metrics rows using a fuzzy match on the user's metric text.
-
-    We treat metrics as 'topics mentioned' rather than numeric facts.
-    """
-    if df.empty or not metric_text:
-        return df
-
-    metric_text = metric_text.lower()
-    mask = False
-
-    for col in ["metric_name", "metric_category", "metric_context", "metric_evidence_span"]:
-        if col in df.columns:
-            col_vals = df[col].fillna("").astype(str).str.lower()
-            mask = mask | col_vals.str.contains(metric_text, na=False)
-
-    filtered = df[mask].copy()
-    return filtered if not filtered.empty else df  # fall back to all if nothing matched
-
-
 def benchmark_peers(
     base_company: str,
     peers: List[str],
-    metric: str,
     filing_type: str,
     quarter: Optional[str],
     temperature: float = 0.2,
 ) -> Tuple[str, Optional[pd.DataFrame]]:
     """
-    Compare base_company vs peers based on what management said about a given topic/metric.
+    Compare base_company vs peers based on overall earnings commentary and metrics.
 
     Behavior:
-    - For each company and quarter, pull rows from metrics.parquet (guidance/topics),
-      filtered by the free-text 'metric' string if possible.
+    - For each company and quarter, pull rows from metrics.parquet (all topics).
     - For each company, also retrieve top transcript snippets via hybrid_search.
-    - Ask the LLM to qualitatively compare how companies talked about that topic
-      (focus, confidence, tone, guidance) WITHOUT inventing exact numbers.
-
-    Returns:
-        (text_summary, table_of_metric_rows)
+    - Ask the LLM to qualitatively compare overall tone, guidance, growth, and risks
+      in simple language for a non-expert.
     """
     if quarter is None:
         return "No quarter selected.", None
@@ -477,7 +634,7 @@ def benchmark_peers(
     if metrics_df.empty:
         text_summary = (
             "metrics.parquet is empty or missing – I can't inspect what each company "
-            "said about this topic yet, only generic transcript search."
+            "said in a structured way yet, only generic transcript search."
         )
         return text_summary, None
 
@@ -486,15 +643,9 @@ def benchmark_peers(
         (metrics_df["ticker"].isin(companies)) & (metrics_df["quarter_str"] == quarter)
     ].copy()
 
-    # If we have metric/topic rows, filter by the user's metric text
+    # Build a table for possible debugging (UI does not show it)
     if not df.empty:
-        df_filtered = _filter_metrics_for_text(df, metric)
-    else:
-        df_filtered = df
-
-    # Build a human-readable table of guidance/topics for display in UI
-    if not df_filtered.empty:
-        table = df_filtered[
+        table = df[
             [
                 "ticker",
                 "metric_name",
@@ -510,16 +661,13 @@ def benchmark_peers(
             ]
         ].rename(columns={"ticker": "company"})
     else:
-        # No structured metric rows at all; we'll still do transcript-based compare
         table = pd.DataFrame({"company": companies})
 
-    # For the LLM: build per-company “evidence”
     company_blobs: List[Dict[str, Any]] = []
 
     for c in companies:
-        c_metrics = df_filtered[df_filtered["ticker"] == c].copy()
+        c_metrics = df[df["ticker"] == c].copy()
 
-        # Turn metrics into light JSON (we don't trust metric_value to be present)
         metrics_json = []
         if not c_metrics.empty:
             metrics_json = c_metrics[
@@ -538,14 +686,12 @@ def benchmark_peers(
                 ]
             ].to_dict(orient="records")
 
-        # Retrieve transcript snippets specifically about this topic
-        # We reuse your hybrid_search to stay consistent with the rest of the app
         vec_results = hybrid_search(
-            query=f"{metric} for this earnings call (guidance, commentary, risks)",
+            query="overall business performance, growth, margins and key risks for this earnings call",
             company=c,
             filing_type=filing_type,
             quarter=quarter,
-            top_k=4,
+            top_k=6,
         )
 
         snippets = [r.get("text", "") for r in vec_results]
@@ -560,7 +706,6 @@ def benchmark_peers(
 
     structured = {
         "quarter": quarter,
-        "metric_query": metric,
         "base_company": str(base_company).upper(),
         "companies": company_blobs,
     }
@@ -568,39 +713,39 @@ def benchmark_peers(
     structured_json_str = json.dumps(structured, indent=2)
 
     prompt = f"""
-You are a sell-side equity research analyst.
+You are a sell-side equity research analyst explaining things to a
+curious everyday investor.
 
-Your task: compare how different tech companies discussed the topic/metric:
+Your task: compare how {base_company} and its peers performed and what
+they emphasized in their {quarter} earnings calls.
 
-    "{metric}"
-
-during the {quarter} earnings calls.
+Avoid heavy finance jargon. Use simple language like:
+- "growing faster/slower than peers"
+- "more optimistic/less optimistic"
+- "talked a lot about risks / did not talk much about risks"
 
 You are given structured evidence for each company:
-- 'metrics': rows from an extracted metrics table that indicate WHAT they talked about
-  (metric_name, metric_category, whether it is guidance, what period, certainty, etc.).
-- 'snippets': short transcript excerpts that mention or relate to this topic.
-
-Important:
-- Many metric_value fields may be null. DO NOT invent exact numbers.
-- Focus on *how* each company talked about the topic: emphasis level, confidence,
-  forward-looking guidance vs historical recap, and risk tone.
+- 'metrics': rows from an extracted metrics table that indicate WHAT they talked about.
+- 'snippets': short transcript excerpts that summarize performance, growth,
+  profitability, and key risks.
 
 Structured evidence (JSON):
 {structured_json_str}
 
-Write a concise comparison that:
-- Starts with 1–2 sentences summarizing the overall picture across all companies.
-- Then has a short section for each company (base company first), describing:
-  - Whether they gave explicit guidance on this topic or only qualitative color.
-  - How confident/hedged they sounded (use metric_certainty + snippets).
-  - Any notable differences in focus vs peers (e.g., one company downplays it,
-    another calls it a key growth driver, another frames it as a risk).
-- Finally, add 2–3 bullets comparing the base company vs peers:
-  who seems strongest/most confident, who is cautious, who gave the most detail.
+Write a short comparison that:
+- Starts with 2–3 sentences summarizing the overall picture across all companies.
+- Then has a short section for each company (base company first), describing in
+  plain English:
+  - Whether their business seems to be doing better, worse, or similar to peers.
+  - What they are most excited about (e.g., a product line or region).
+  - How worried or relaxed they sound about risks.
 
-Do NOT fabricate numeric values. If the data doesn't show numbers,
-describe the *style and content* of the commentary instead.
+- Finish with 3–5 bullets clearly comparing the base company vs peers:
+  - who seems in the strongest position right now,
+  - who sounds most optimistic,
+  - who mentioned the biggest risks.
+
+Do NOT invent exact numbers. Focus on direction and tone only.
 """
 
     text_summary = _call_llm(prompt, temperature=temperature)

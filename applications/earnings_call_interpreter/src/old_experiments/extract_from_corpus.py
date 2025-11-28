@@ -160,8 +160,18 @@ RESPONSE_SCHEMA = ExtractionResponse.model_json_schema()
 
 SYSTEM_PROMPT = """
 You are an expert financial information extraction model.
-You read earnings call statements and extract metrics, guidance, risks, and business segments.
-Always return valid JSON following the exact response_schema.
+You receive a single earnings call *statement* (not the entire transcript).
+Extract only the most relevant (top) few items.
+
+Hard constraints:
+- metrics: MAX 5
+- risks: MAX 3
+- segments: MAX 5
+
+Never return more than these limits.
+Never invent text.
+Only use the exact JSON schema.
+Return ONLY JSON.
 """
 
 
@@ -188,6 +198,7 @@ def call_gemini(prompt: str, max_retries: int = 8, base_backoff: float = 5.0) ->
                     system_instruction=SYSTEM_PROMPT,
                     response_mime_type="application/json",
                     response_schema=RESPONSE_SCHEMA,
+                    max_output_tokens=2048
                 ),
             )
             return response.text

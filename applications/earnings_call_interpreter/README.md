@@ -7,7 +7,7 @@ Analyzing earnings calls and financial filings is slow and error-prone. This pro
 
 ## Features
 
-- Natural language Q&A over earnings calls and 10-Q/10-K filings.
+- Natural language Q&A over earnings calls.
 - Automatic executive summaries of company performance.
 - Peer benchmarking and competitive analysis across industry verticals.
 - Streamlit UI for interactive exploration.
@@ -15,9 +15,9 @@ Analyzing earnings calls and financial filings is slow and error-prone. This pro
 ## Tech Stack
 
 - **Python**, **Streamlit**
-- **Vector DB**: e.g., Chroma / Qdrant / pgvector
-- **Knowledge Graph**: e.g., Neo4j / NetworkX
-- **LLM + Embeddings**: OpenAI or other provider
+- **Vector DB**: Chroma
+- **Knowledge Graph**: NetworkX
+- **LLM + Embeddings**: Gemini 2.5 Flash Lite
 
 ## Structure
 

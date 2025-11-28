@@ -50,36 +50,116 @@ def _sanitize_text_for_pdf(text: str) -> str:
     return text
 
 
-def _create_summary_pdf(company: str, quarter: str, summary_md: str) -> bytes:
+def _parse_summary_sections(summary_md: str):
     """
-    Very simple text-only PDF from the markdown summary.
-    Requires `fpdf` library to be installed.
+    Parse the markdown summary into:
+      - snapshot heading line (## ...)
+      - dict of {subheading -> markdown body}
+
+    Assumes subheadings start with '### '.
+    """
+    snapshot_heading = None
+    sections = {}
+    current_sub = None
+    buffer = []
+
+    lines = summary_md.splitlines()
+    for line in lines:
+        if line.startswith("## "):
+            snapshot_heading = line.strip()
+            continue
+
+        if line.startswith("### "):
+            # flush previous
+            if current_sub is not None:
+                sections[current_sub] = "\n".join(buffer).strip()
+            current_sub = line[4:].strip()
+            buffer = []
+        else:
+            if current_sub is not None:
+                buffer.append(line)
+
+    if current_sub is not None and buffer:
+        sections[current_sub] = "\n".join(buffer).strip()
+
+    return snapshot_heading, sections
+
+
+def _create_summary_pdf(company: str, quarter: str, summary_md: str, tldr: str) -> bytes:
+    """
+    Nicer single-page PDF:
+    - Title
+    - TL;DR
+    - Key Numbers
+    - What Changed vs Previous Quarter
+    - Guidance & Outlook
+    - Risks & Watchpoints
+
+    Uses only plain ASCII so FPDF's latin-1 encoding never crashes.
     """
     if not HAS_FPDF:
         return b""
 
     summary_md = _sanitize_text_for_pdf(summary_md)
+    tldr = _sanitize_text_for_pdf(tldr or "")
+
+    snapshot_heading, sections = _parse_summary_sections(summary_md)
 
     pdf = FPDF()
     pdf.set_auto_page_break(auto=True, margin=15)
     pdf.add_page()
-    pdf.set_font("Arial", size=12)
 
-    title = f"Earnings Summary - {company} {quarter}"
-    pdf.multi_cell(0, 10, title)
-    pdf.ln(5)
+    # Title
+    pdf.set_font("Arial", "B", 16)
+    title = f"{company} - {quarter} Earnings Snapshot"
+    pdf.multi_cell(0, 10, _sanitize_text_for_pdf(title))
+    pdf.ln(2)
 
-    # Strip markdown headings for PDF
-    text = summary_md.replace("## ", "").replace("### ", "")
-    for line in text.split("\n"):
-        line = _sanitize_text_for_pdf(line)
-        pdf.multi_cell(0, 8, line)
+    # TL;DR
+    if tldr:
+        pdf.set_font("Arial", "B", 12)
+        pdf.multi_cell(0, 8, "TL;DR")
+        pdf.set_font("Arial", "", 11)
+        pdf.multi_cell(0, 6, tldr)
+        pdf.ln(4)
 
-    # FPDF returns a str in Python3; encode safely
+    def print_section(title_text: str, body: str):
+        """Print a section with a bold heading and ASCII '-' bullets."""
+        if not body:
+            return
+        body = _sanitize_text_for_pdf(body)
+
+        pdf.set_font("Arial", "B", 12)
+        pdf.multi_cell(0, 8, title_text)
+        pdf.set_font("Arial", "", 11)
+
+        for line in body.splitlines():
+            stripped = line.strip()
+            if not stripped:
+                continue
+            if stripped.startswith(("-", "*")):
+                # Markdown bullet -> normal ASCII dash bullet
+                content = stripped[1:].strip()
+                pdf.multi_cell(0, 6, f"- {content}")
+            else:
+                pdf.multi_cell(0, 6, stripped)
+        pdf.ln(3)
+
+    # Sections in desired order
+    print_section("Key numbers", sections.get("Key Numbers", ""))
+    print_section(
+        "What changed vs previous quarter",
+        sections.get("What Changed vs Previous Quarter", ""),
+    )
+    print_section("Guidance & outlook", sections.get("Guidance & Outlook", ""))
+    print_section("Risks & watchpoints", sections.get("Risks & Watchpoints", ""))
+
+    # `output(dest="S")` returns a str in FPDF 1.x; make sure we return bytes.
     out = pdf.output(dest="S")
     if isinstance(out, bytes):
         return out
     return out.encode("latin-1", "replace")
+
 
 
 def _render_summary_analytics(company: str, quarter: str, analytics: dict):
@@ -108,11 +188,11 @@ def _render_summary_analytics(company: str, quarter: str, analytics: dict):
 
     col1, col2, col3 = st.columns(3)
     with col1:
-        st.metric("Overall tone", sentiment_label)
+        st.metric("Overall feeling of the call", sentiment_label)
     with col2:
-        st.metric("Guidance vs expectations", guidance_label)
+        st.metric("Did they raise or cut guidance?", guidance_label)
     with col3:
-        st.metric("Risk level", risk_level)
+        st.metric("Risk level mentioned on the call", risk_level)
 
     # Sentiment bar
     sentiment_df = pd.DataFrame(
@@ -121,17 +201,18 @@ def _render_summary_analytics(company: str, quarter: str, analytics: dict):
             "Score": [pos, neu, neg],
         }
     ).set_index("Sentiment")
-    st.markdown("**How did the call feel overall?**")
+    st.markdown("**How positive or negative was management?**")
     st.bar_chart(sentiment_df)
+    st.caption("Higher 'Positive' means they sounded upbeat. Higher 'Negative' means more worry or caution.")
 
     # Focus segments
     if focus_segments:
-        st.markdown("**What management focused on**")
+        st.markdown("**What they talked about most**")
         st.markdown(" · ".join(focus_segments))
 
     # Top risks
     if top_risks:
-        st.markdown("**Main risks they talked about**")
+        st.markdown("**Main risks they highlighted**")
         st.markdown(" · ".join(top_risks))
 
 
@@ -302,7 +383,7 @@ with tab_qna:
 
 
 # --------------------------------------------------------------------
-# Summary tab – user-friendly + analytics + PDF, no raw metric tables
+# Summary tab – user-friendly + analytics + TL;DR + PDF
 # --------------------------------------------------------------------
 with tab_summary:
     st.subheader("Generate an executive summary")
@@ -314,7 +395,7 @@ with tab_summary:
             st.error("No earnings call data available for this company/period.")
         else:
             with st.spinner("Summarizing company performance in plain English..."):
-                summary, sources, analytics = generate_summary(
+                summary, sources, analytics, tldr = generate_summary(
                     company=company,
                     filing_type=filing_type,
                     quarter=quarter,
@@ -325,15 +406,47 @@ with tab_summary:
             # Overview + sentiment/guidance/risk/focus
             _render_summary_analytics(company, quarter, analytics or {})
 
-            st.markdown("### Summary")
-            st.markdown(summary)
+            # TL;DR line
+            if tldr:
+                st.markdown(f"**TL;DR:** {tldr}")
+
+            # Split summary into sections so we can use expanders
+            snapshot_heading, sections = _parse_summary_sections(summary or "")
+
+            # Snapshot heading
+            if snapshot_heading:
+                st.markdown(snapshot_heading)
+            else:
+                st.markdown(f"## Snapshot – {company} {quarter}")
+
+            # Always-visible sections
+            if "Key Numbers" in sections:
+                st.markdown("### 🔢 Key numbers")
+                st.markdown(sections["Key Numbers"])
+
+            if "What Changed vs Previous Quarter" in sections:
+                st.markdown("### 📈 What changed vs previous quarter")
+                st.markdown(sections["What Changed vs Previous Quarter"])
+
+            # Expanders for deeper detail
+            if "Segment Performance" in sections:
+                with st.expander("More detail on which parts of the business did what"):
+                    st.markdown(sections["Segment Performance"])
+
+            if "Guidance & Outlook" in sections:
+                with st.expander("More detail on guidance & outlook"):
+                    st.markdown(sections["Guidance & Outlook"])
+
+            if "Risks & Watchpoints" in sections:
+                with st.expander("More detail on risks & things to watch"):
+                    st.markdown(sections["Risks & Watchpoints"])
 
             # Download as PDF
             if HAS_FPDF:
-                pdf_bytes = _create_summary_pdf(company, quarter, summary)
+                pdf_bytes = _create_summary_pdf(company, quarter, summary, tldr)
                 if pdf_bytes:
                     st.download_button(
-                        label="📥 Download summary as PDF",
+                        label="📥 Download 1-page PDF summary",
                         data=pdf_bytes,
                         file_name=f"{company}_{quarter}_summary.pdf",
                         mime="application/pdf",

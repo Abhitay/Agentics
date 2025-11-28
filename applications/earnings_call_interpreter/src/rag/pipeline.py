@@ -205,8 +205,106 @@ def get_company_quarter_risks(company: str, quarter: str) -> pd.DataFrame:
 
 
 # --------------------------------------------------------------------
-# Q&A – vector + structured metrics
+# Q&A – agentic planner + execution
 # --------------------------------------------------------------------
+def _plan_question_tools(question: str) -> Dict[str, Any]:
+    """
+    Lightweight "agent" planner for Q&A.
+
+    Given the user's question, decide:
+      - Do we need vector search (transcript snippets)?
+      - Do we need structured metrics?
+      - Do we need segments?
+      - Do we need risks?
+      - If we use vector search, what query should we send?
+
+    Returns a dict like:
+    {
+        "use_vector_search": true,
+        "use_metrics": true,
+        "use_segments": false,
+        "use_risks": true,
+        "vector_query": "refined query to use"
+    }
+    """
+    planner_prompt = f"""
+You are planning how to answer this question about an earnings call:
+
+Question: "{question}"
+
+You have four internal tools:
+
+1) vector_search
+   - Returns small chunks of the call transcript that are semantically
+     related to a query string.
+   - Best for: management commentary, qualitative color, explanations,
+     and anything the speakers said in words.
+
+2) metrics_lookup
+   - Returns structured numerical facts (revenue, profit, growth, margins, etc.)
+     extracted from the call.
+   - Best for: "what is the revenue?", "what was EPS?", "how fast did X grow?",
+     and other numeric questions.
+
+3) segments_lookup
+   - Returns structured info about how different parts of the business performed
+     (segments/products/regions) and whether they are up, down, or flat.
+   - Best for: "which segment grew the most?", "how did services do?", etc.
+
+4) risks_lookup
+   - Returns structured info about risks the company mentioned: type of risk,
+     severity, sentiment, and context.
+   - Best for: "what risks did they highlight?", "are they worried about macro?", etc.
+
+Your task:
+Decide WHICH of these tools are actually needed to answer the user's question,
+and, if you plan to use vector_search, write a refined search query.
+
+Return ONLY valid JSON, no extra text, with this exact shape:
+
+{{
+  "use_vector_search": true or false,
+  "use_metrics": true or false,
+  "use_segments": true or false,
+  "use_risks": true or false,
+  "vector_query": "a short search query for vector_search"
+}}
+
+Guidelines:
+- If the user asks for a specific NUMBER (like revenue, EPS, margin, guidance),
+  you almost always want metrics_lookup (and optionally vector_search for context).
+- If the user asks about "what management said" or "tone" or "why something happened",
+  you definitely want vector_search.
+- If the user asks about segments (iPhone, cloud, services, regions, etc.),
+  you probably want segments_lookup (+ optionally vector_search).
+- If the user asks about risks, macro, uncertainty, or headwinds,
+  you probably want risks_lookup (+ optionally vector_search).
+
+If you are unsure, it's OK to set a tool to true. Just keep the JSON valid.
+"""
+
+    raw = _call_llm(planner_prompt, temperature=0.1)
+
+    # Sensible defaults if parsing fails
+    default_plan = {
+        "use_vector_search": True,
+        "use_metrics": True,
+        "use_segments": True,
+        "use_risks": True,
+        "vector_query": question,
+    }
+
+    try:
+        plan = json.loads(raw)
+        for k, v in default_plan.items():
+            plan.setdefault(k, v)
+        if not isinstance(plan.get("vector_query"), str) or not plan["vector_query"].strip():
+            plan["vector_query"] = question
+        return plan
+    except Exception:
+        return default_plan
+
+
 def answer_question(
     question: str,
     company: str,
@@ -215,132 +313,149 @@ def answer_question(
     temperature: float = 0.2,
 ) -> Tuple[str, List[Dict[str, Any]]]:
     """
-    Main Q&A entrypoint.
+    Main Q&A entrypoint with a lightweight "agentic" planner.
 
-    Uses BOTH:
-    - Vector search (transcript snippets) for qualitative/contextual answers.
-    - Structured metrics/segments/risks for numeric facts (revenue, EPS, margins, etc.).
+    Steps:
+    1) Ask a small planner LLM which sources we need.
+    2) Call only those data sources.
+    3) Feed the combined evidence into a final answer LLM call.
 
-    If a requested number is in the structured data, the model should use that.
-    If it's not available anywhere, it should explicitly say so.
+    Returns:
+        answer_text, vector_sources (for UI evidence display)
     """
     if quarter is None:
         return "No quarter selected.", []
 
-    # 1) Retrieve transcript context from vector store
-    vec_results = hybrid_search(
-        query=question,
-        company=company,
-        filing_type=filing_type,
-        quarter=quarter,
-        top_k=8,
-    )
+    # 1) PLAN
+    plan = _plan_question_tools(question)
+    use_vec = bool(plan.get("use_vector_search", True))
+    use_metrics = bool(plan.get("use_metrics", True))
+    use_segments = bool(plan.get("use_segments", True))
+    use_risks = bool(plan.get("use_risks", True))
+    vec_query = plan.get("vector_query") or question
+
+    # 2) ACT – vector search
+    vec_results: List[Dict[str, Any]] = []
+    if use_vec:
+        vec_results = hybrid_search(
+            query=vec_query,
+            company=company,
+            filing_type=filing_type,
+            quarter=quarter,
+            top_k=8,
+        )
 
     if vec_results:
-        context = "\n\n---\n\n".join([r.get("text", "") for r in vec_results])
+        transcript_context = "\n\n---\n\n".join([r.get("text", "") for r in vec_results])
+    elif use_vec:
+        transcript_context = "NO RELEVANT TRANSCRIPT SNIPPETS FOUND FOR THIS QUESTION."
     else:
-        context = "NO TRANSCRIPT CONTEXT AVAILABLE"
+        transcript_context = "VECTOR SEARCH WAS NOT USED FOR THIS QUESTION."
 
-    # 2) Structured data for this company/quarter
-    current_metrics_df = get_company_quarter_metrics(company, quarter)
-    if not current_metrics_df.empty:
-        metric_cols = [
-            "metric_name",
-            "metric_category",
-            "metric_value",
-            "metric_value_type",
-            "metric_unit",
-            "metric_currency",
-            "metric_direction",
-            "metric_is_guidance",
-            "metric_period",
-            "metric_certainty",
-            "metric_context",
-        ]
-        metric_cols = [c for c in metric_cols if c in current_metrics_df.columns]
-        current_metrics_json = current_metrics_df[metric_cols].to_dict(orient="records")
-    else:
-        current_metrics_json = []
+    # 2b) metrics
+    metrics_json: List[Dict[str, Any]] = []
+    if use_metrics:
+        current_metrics_df = get_company_quarter_metrics(company, quarter)
+        if not current_metrics_df.empty:
+            metric_cols = [
+                "metric_name",
+                "metric_category",
+                "metric_value",
+                "metric_value_type",
+                "metric_unit",
+                "metric_currency",
+                "metric_direction",
+                "metric_is_guidance",
+                "metric_period",
+                "metric_certainty",
+                "metric_context",
+            ]
+            metric_cols = [c for c in metric_cols if c in current_metrics_df.columns]
+            metrics_json = current_metrics_df[metric_cols].to_dict(orient="records")
 
-    segments_df = get_company_quarter_segments(company, quarter)
-    if not segments_df.empty:
-        seg_cols = [
-            "segment_name",
-            "segment_direction",
-            "segment_is_guidance",
-            "segment_certainty",
-            "segment_context",
-        ]
-        seg_cols = [c for c in seg_cols if c in segments_df.columns]
-        segments_json = segments_df[seg_cols].to_dict(orient="records")
-    else:
-        segments_json = []
+    # 2c) segments
+    segments_json: List[Dict[str, Any]] = []
+    if use_segments:
+        segments_df = get_company_quarter_segments(company, quarter)
+        if not segments_df.empty:
+            seg_cols = [
+                "segment_name",
+                "segment_direction",
+                "segment_is_guidance",
+                "segment_certainty",
+                "segment_context",
+            ]
+            seg_cols = [c for c in seg_cols if c in segments_df.columns]
+            segments_json = segments_df[seg_cols].to_dict(orient="records")
 
-    risks_df = get_company_quarter_risks(company, quarter)
-    if not risks_df.empty:
-        risk_cols = [
-            "risk_type",
-            "risk_sentiment",
-            "risk_severity",
-            "risk_certainty",
-            "risk_context",
-        ]
-        risk_cols = [c for c in risk_cols if c in risks_df.columns]
-        risks_json = risks_df[risk_cols].to_dict(orient="records")
-    else:
-        risks_json = []
+    # 2d) risks
+    risks_json: List[Dict[str, Any]] = []
+    if use_risks:
+        risks_df = get_company_quarter_risks(company, quarter)
+        if not risks_df.empty:
+            risk_cols = [
+                "risk_type",
+                "risk_sentiment",
+                "risk_severity",
+                "risk_certainty",
+                "risk_context",
+            ]
+            risk_cols = [c for c in risk_cols if c in risks_df.columns]
+            risks_json = risks_df[risk_cols].to_dict(orient="records")
 
-    structured = {
+    # 3) OBSERVE – bundle evidence
+    evidence = {
         "company": company,
         "quarter": quarter,
-        "metrics": current_metrics_json,
+        "plan": plan,
+        "metrics": metrics_json,
         "segments": segments_json,
         "risks": risks_json,
     }
-    structured_json_str = json.dumps(structured, indent=2)
+    evidence_json_str = json.dumps(evidence, indent=2)
 
-    prompt = f"""
-You are a helpful equity research assistant answering a question about
-{company} in {quarter}.
+    # 4) ANSWER
+    final_prompt = f"""
+You are a helpful research assistant answering a question
+about {company} in {quarter}.
 
 Your audience is a smart person with little or no finance background.
-Explain things in simple language. Avoid heavy jargon. If you must use
-a finance term (like "margin" or "guidance"), briefly explain it in
-plain English.
+Use simple language and avoid heavy jargon. If you must use a finance
+term (like "margin" or "guidance"), briefly explain it.
 
-You have TWO sources of evidence:
+I am giving you:
+1) A small JSON blob that describes which data sources we used for this
+   question and the structured information retrieved from them.
+2) Transcript snippets from the earnings call (if vector search was used).
 
-1) Structured JSON with extracted metrics, segments and risks.
-   - Use this for all NUMERIC facts (e.g., revenue, profit, growth).
-   - If the user asks for a specific number (like "What is the revenue?"),
-     look for a relevant metric_name/metric_category first.
-   - If multiple related metrics exist (e.g. actual vs guidance), explain clearly.
+The planner JSON (what we decided to use + structured data):
 
-2) Transcript context from the earnings call.
-   - Use this for qualitative color, commentary, drivers, and explanations.
-   - If something is not clearly supported by either structured data or transcripts,
-     say you don't have that information.
+{evidence_json_str}
 
-If you cannot find the requested numeric value in the structured data,
-DO NOT invent a number. Instead, say that the exact figure is not available
-in your extracted metrics, and you can only speak qualitatively if the
-transcript provides hints.
-
-Structured data (JSON):
-{structured_json_str}
-
-Transcript context:
-{context}
+Transcript context (if used):
+{transcript_context}
 
 User question:
 {question}
 
-Now provide a short, clear answer (2–6 sentences). Use plain English,
-and imagine you are explaining it to a friend who owns the stock but
-is not a finance professional.
+Instructions:
+- If the user asks for a specific NUMBER (revenue, EPS, growth, etc.),
+  first look in the metrics section of the JSON. Use those values if present.
+- Use the transcript snippets to explain *why* things happened or what
+  management said in plain English.
+- If a requested number is NOT in the metrics, do NOT make one up.
+  Instead, say that the exact figure isn't available in your structured data,
+  and answer qualitatively if the context allows.
+- If a particular data source was not used (for example, segments or risks),
+  don't mention it at all in the answer.
+
+Output:
+- A short, clear answer (2–6 sentences).
+- Plain English, as if you are explaining it to a friend who owns the stock
+  but is not a finance professional.
 """
 
-    answer = _call_llm(prompt, temperature=temperature)
+    answer = _call_llm(final_prompt, temperature=temperature)
     return answer, vec_results
 
 
@@ -429,64 +544,206 @@ Earnings call context:
         return default_analytics
 
 
+def _generate_tldr(
+    structured_json_str: str,
+    context: str,
+    company: str,
+    quarter: str,
+) -> str:
+    """
+    Generate a one-sentence TL;DR in plain English.
+    """
+    prompt = f"""
+You are summarizing an earnings call for {company} in {quarter}.
+
+Using the structured data and context below, write ONE sentence
+(max 35 words) that explains in plain English how the quarter went
+overall for a regular investor (not a finance expert).
+
+Avoid jargon. Do not include headings or bullet points.
+
+Structured data:
+{structured_json_str}
+
+Earnings call context:
+{context}
+"""
+    tldr = _call_llm(prompt, temperature=0.2).strip()
+    # Make sure it's a single line
+    return " ".join(tldr.split())
+
+
 # --------------------------------------------------------------------
-# Executive summary – structured + metrics-aware + analytics
+# Summary – agentic planner + execution + analytics + TL;DR
 # --------------------------------------------------------------------
+def _plan_summary_tools(
+    company: str,
+    quarter: str,
+    compare_previous: bool,
+) -> Dict[str, Any]:
+    """
+    Planner for the summary generation.
+
+    Decide:
+      - use_vector_search
+      - use_metrics
+      - use_segments
+      - use_risks
+      - use_previous_quarter
+      - vector_query (what to search for in transcripts)
+    """
+    planner_prompt = f"""
+You are planning how to build a short, plain-English summary of the
+{quarter} earnings call for {company}.
+
+You have these internal tools:
+
+1) vector_search
+   - Returns chunks of the call transcript for a query string.
+   - Good for: management commentary, explanations, tone, guidance, risks.
+
+2) metrics_lookup
+   - Returns structured numerical facts: revenue, profit, growth, margins, etc.
+   - Good for: "key numbers" and "what changed vs last quarter".
+
+3) segments_lookup
+   - Returns structured info about how different parts of the business did
+     (segments/products/regions) and whether they are up, down, or flat.
+
+4) risks_lookup
+   - Returns structured info about risks: what type, how severe, what context.
+
+5) previous_quarter_lookup
+   - Allows comparing the current quarter vs the immediately previous one.
+
+Your task:
+Decide which of these tools are needed for a simple, investor-friendly
+summary with sections like Key Numbers, What Changed, Segment Performance,
+Guidance & Outlook, and Risks & Watchpoints.
+
+Return ONLY valid JSON, no extra text, with this exact shape:
+
+{{
+  "use_vector_search": true or false,
+  "use_metrics": true or false,
+  "use_segments": true or false,
+  "use_risks": true or false,
+  "use_previous_quarter": true or false,
+  "vector_query": "a short query for vector_search"
+}}
+
+Guidelines:
+- You almost always want metrics_lookup for a summary (to get key numbers).
+- You almost always want vector_search to get management commentary and tone.
+- Use segments_lookup when segment-level color would add value.
+- Use risks_lookup when the call likely has meaningful risk discussion.
+- use_previous_quarter can be false if compare_previous is false or not needed.
+
+The caller has requested compare_previous={str(compare_previous)}.
+This is a strong hint for whether previous_quarter_lookup should be used.
+"""
+
+    raw = _call_llm(planner_prompt, temperature=0.1)
+
+    default_plan = {
+        "use_vector_search": True,
+        "use_metrics": True,
+        "use_segments": True,
+        "use_risks": True,
+        "use_previous_quarter": compare_previous,
+        "vector_query": "overall performance, key numbers, what changed vs last quarter, segment performance, guidance, and key risks",
+    }
+
+    try:
+        plan = json.loads(raw)
+        for k, v in default_plan.items():
+            plan.setdefault(k, v)
+        if not isinstance(plan.get("vector_query"), str) or not plan["vector_query"].strip():
+            plan["vector_query"] = default_plan["vector_query"]
+        return plan
+    except Exception:
+        return default_plan
+
+
 def generate_summary(
     company: str,
     filing_type: str,
     quarter: Optional[str],
     temperature: float = 0.2,
     compare_previous: bool = True,
-) -> Tuple[str, List[Dict[str, Any]], Dict[str, Any]]:
+) -> Tuple[str, List[Dict[str, Any]], Dict[str, Any], str]:
     """
     Generate an executive summary of the company's earnings call.
 
-    Uses:
-    - Vector search over call statements for narrative context.
-    - Structured metrics for this quarter (+ previous quarter if available).
-    - Segments and risks tables for extra color.
-    - LLM-based analytics (sentiment, guidance stance, risk, focus segments).
+    Now agentic:
+    - Planner decides which sources to use and how to query vector search.
+    - Execution pulls only those sources.
+    - We then compute analytics and TL;DR, and write a plain-English summary.
+
+    Returns:
+        summary_markdown, vector_sources, analytics_dict, tldr_string
     """
     if quarter is None:
-        return "No quarter selected.", [], {}
+        return "No quarter selected.", [], {}, ""
 
-    # 1) Vector context from earnings call
-    vec_results = hybrid_search(
-        query="key highlights, management commentary, guidance, and risks from this earnings call",
-        company=company,
-        filing_type=filing_type,
-        quarter=quarter,
-        top_k=10,
+    # 1) PLAN
+    plan = _plan_summary_tools(company, quarter, compare_previous)
+    use_vec = bool(plan.get("use_vector_search", True))
+    use_metrics = bool(plan.get("use_metrics", True))
+    use_segments = bool(plan.get("use_segments", True))
+    use_risks = bool(plan.get("use_risks", True))
+    use_prev_q = bool(plan.get("use_previous_quarter", compare_previous))
+    vec_query = plan.get("vector_query") or "overall performance and guidance"
+
+    # 2) ACT – vector context
+    vec_results: List[Dict[str, Any]] = []
+    if use_vec:
+        vec_results = hybrid_search(
+            query=vec_query,
+            company=company,
+            filing_type=filing_type,
+            quarter=quarter,
+            top_k=10,
+        )
+
+    context = (
+        "\n\n---\n\n".join([r["text"] for r in vec_results])
+        if vec_results
+        else (
+            "NO TRANSCRIPT CONTEXT AVAILABLE"
+            if use_vec
+            else "VECTOR SEARCH WAS NOT USED FOR THIS SUMMARY."
+        )
     )
 
-    context = "\n\n---\n\n".join([r["text"] for r in vec_results]) or "NO CONTEXT AVAILABLE"
-
-    # 2) Structured metrics for current quarter
-    current_metrics_df = get_company_quarter_metrics(company, quarter)
-    if not current_metrics_df.empty:
-        cols = [
-            "metric_name",
-            "metric_category",
-            "metric_value",
-            "metric_value_type",
-            "metric_unit",
-            "metric_currency",
-            "metric_direction",
-            "metric_is_guidance",
-            "metric_period",
-        ]
-        cols = [c for c in cols if c in current_metrics_df.columns]
-        current_metrics_json = current_metrics_df[cols].to_dict(orient="records")
+    # 2b) current metrics
+    if use_metrics:
+        current_metrics_df = get_company_quarter_metrics(company, quarter)
+        if not current_metrics_df.empty:
+            cols = [
+                "metric_name",
+                "metric_category",
+                "metric_value",
+                "metric_value_type",
+                "metric_unit",
+                "metric_currency",
+                "metric_direction",
+                "metric_is_guidance",
+                "metric_period",
+            ]
+            cols = [c for c in cols if c in current_metrics_df.columns]
+            current_metrics_json = current_metrics_df[cols].to_dict(orient="records")
+        else:
+            current_metrics_json = []
     else:
         current_metrics_json = []
 
-    # 3) Previous quarter metrics (if requested and available)
+    # 2c) previous quarter metrics
     prev_quarter: Optional[str] = None
     prev_metrics_json: List[Dict[str, Any]] = []
-    if compare_previous:
+    if compare_previous and use_prev_q:
         prev_quarter = get_previous_quarter(company, quarter)
-        if prev_quarter is not None:
+        if prev_quarter:
             prev_df = get_company_quarter_metrics(company, prev_quarter)
             if not prev_df.empty:
                 cols = [
@@ -503,40 +760,49 @@ def generate_summary(
                 cols = [c for c in cols if c in prev_df.columns]
                 prev_metrics_json = prev_df[cols].to_dict(orient="records")
 
-    # 4) Segments & risks
-    segments_df = get_company_quarter_segments(company, quarter)
-    segments_json = (
-        segments_df[
-            [
-                "segment_name",
-                "segment_direction",
-                "segment_is_guidance",
-                "segment_certainty",
-                "segment_context",
-            ]
-        ].to_dict(orient="records")
-        if not segments_df.empty
-        else []
-    )
+    # 2d) segments
+    if use_segments:
+        segments_df = get_company_quarter_segments(company, quarter)
+        segments_json = (
+            segments_df[
+                [
+                    "segment_name",
+                    "segment_direction",
+                    "segment_is_guidance",
+                    "segment_certainty",
+                    "segment_context",
+                ]
+            ].to_dict(orient="records")
+            if not segments_df.empty
+            else []
+        )
+    else:
+        segments_json = []
 
-    risks_df = get_company_quarter_risks(company, quarter)
-    risks_json = (
-        risks_df[
-            [
-                "risk_type",
-                "risk_sentiment",
-                "risk_severity",
-                "risk_certainty",
-                "risk_context",
-            ]
-        ].to_dict(orient="records")
-        if not risks_df.empty
-        else []
-    )
+    # 2e) risks
+    if use_risks:
+        risks_df = get_company_quarter_risks(company, quarter)
+        risks_json = (
+            risks_df[
+                [
+                    "risk_type",
+                    "risk_sentiment",
+                    "risk_severity",
+                    "risk_certainty",
+                    "risk_context",
+                ]
+            ].to_dict(orient="records")
+            if not risks_df.empty
+            else []
+        )
+    else:
+        risks_json = []
 
+    # 3) Bundle structured evidence
     structured = {
         "company": company,
         "quarter": quarter,
+        "plan": plan,
         "current_metrics": current_metrics_json,
         "previous_quarter": prev_quarter,
         "previous_metrics": prev_metrics_json,
@@ -546,9 +812,11 @@ def generate_summary(
 
     structured_json_str = json.dumps(structured, indent=2)
 
-    # 5) Analytics for UI (sentiment, guidance, risk, focus)
+    # 4) Analytics & TL;DR
     analytics = _analyze_call_analytics(structured_json_str, context)
+    tldr = _generate_tldr(structured_json_str, context, company, quarter)
 
+    # 5) Final summary in plain English
     summary_prompt = f"""
 You are an equity research analyst writing a short summary
 for a regular investor who follows {company}.
@@ -557,16 +825,14 @@ The reader is smart but NOT a finance expert. Use simple language,
 avoid jargon, and keep each bullet easy to understand. If you use a
 finance term (like "margin" or "guidance"), briefly explain it.
 
-You are given:
-1) Structured JSON with metrics, segments, and risks for the current quarter
-   and, if available, the previous quarter.
-2) Text context from the earnings call.
+Do NOT use markdown italics anywhere (no *word*). If you want to
+highlight something, you may use bold only for short labels at the
+start of a bullet, like **Total revenue:**.
 
-- Use the JSON for all NUMBERS (revenue, profit, growth, etc.).
-- Use the text context for explanations, color, and simple storytelling.
-- If previous quarter data is available, clearly say whether things are
-  better, worse, or roughly the same.
-- If some metrics are missing, say that the data isn't available.
+You are given:
+1) A JSON blob with metrics, segments, risks, and information about which
+   tools were used to build this summary.
+2) Text context from the earnings call (or a note if no transcript was used).
 
 Structured data (JSON):
 {structured_json_str}
@@ -583,6 +849,7 @@ Write a markdown summary with the following sections:
 
 ### What Changed vs Previous Quarter
 - 2–4 bullets describing whether things got better, worse, or stayed similar.
+- If previous quarter data is missing or not used, say that briefly.
 
 ### Segment Performance
 - 2–4 bullets on which parts of the business did well or struggled
@@ -597,14 +864,16 @@ Write a markdown summary with the following sections:
 
 Keep the whole summary fairly short (around 250–400 words).
 Use simple, clear sentences and avoid long paragraphs.
+Mention if there are important gaps in the data (for example, if
+you don't have previous-quarter metrics or certain numbers).
 """
 
     summary = _call_llm(summary_prompt, temperature=temperature)
-    return summary, vec_results, analytics
+    return summary, vec_results, analytics, tldr
 
 
 # --------------------------------------------------------------------
-# Peer benchmarking – overall, simple language
+# Peer benchmarking – overall, simple language (unchanged logic)
 # --------------------------------------------------------------------
 def benchmark_peers(
     base_company: str,
@@ -687,7 +956,7 @@ def benchmark_peers(
             ].to_dict(orient="records")
 
         vec_results = hybrid_search(
-            query="overall business performance, growth, margins and key risks for this earnings call",
+            query="overall business performance, growth, profitability and key risks for this earnings call",
             company=c,
             filing_type=filing_type,
             quarter=quarter,

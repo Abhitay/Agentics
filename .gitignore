@@ -118,3 +118,5 @@ earnings_call_interpreter/**/.cache/
 # Keep SOURCE CODE ALWAYS
 ########################################
 !earnings_call_interpreter/**/*.py
+
+applications/earnings_call_interpreter/.env.example

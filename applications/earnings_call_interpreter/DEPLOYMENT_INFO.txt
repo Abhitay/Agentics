@@ -1,0 +1,16 @@
+Project Slug: tech-earnings-rag
+Student Name: Abhitay Shinde, Priyamvada Daga, Sushmita Korishetty
+Student Email: aps2249@columbia.edu
+Main File: app.py
+
+Environment Variables Needed:
+- GEMINI_API_KEY= YES
+- NEO4J_URI= YES
+- NEO4J_USERNAME= YES
+- NEO4J_PASSWORD= YES
+
+Verified Working Locally: YES
+Verified Working in Docker: YES
+
+Notes:
+- app.py is located in src/ui/app.py

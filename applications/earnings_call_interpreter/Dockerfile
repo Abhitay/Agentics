@@ -12,21 +12,21 @@ RUN apt-get update && \
         python3-dev && \
     rm -rf /var/lib/apt/lists/*
 
-# Copy requirements first (better Docker layer caching)
+# Copy requirements first (for Docker build caching)
 COPY requirements.txt .
 
 # Install Python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy the rest of the application
+# Copy the rest of the application code and data
 COPY . .
 
-# Expose Streamlit port
+# Expose Streamlit default port
 EXPOSE 8501
 
 # 🔴 IMPORTANT:
-# - Replace tech-earnings-rag with YOUR slug
-# - We keep main file as src/ui/app.py (no structure changes)
+# - baseUrlPath must match your slug
+# - main file is src/ui/app.py
 CMD ["streamlit", "run", "src/ui/app.py", \
      "--server.port=8501", \
      "--server.address=0.0.0.0", \

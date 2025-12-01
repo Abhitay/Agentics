@@ -99,10 +99,12 @@ earnings_call_interpreter/data/chroma/
 earnings_call_interpreter/data/processed/checkpoint_processed_ids.txt
 
 # Ignore large processed datasets (keep corpus definitions)
-earnings_call_interpreter/data/**/*.parquet
+!earnings_call_interpreter/data/**/*.parquet
 !earnings_call_interpreter/data/corpus/*.parquet  # <-- keep core input
 !earnings_call_interpreter/data/universe/*.parquet # <-- keep reference universe
 
+applications/earnings_call_interpreter/.env
+applications/earnings_call_interpreter/*env*
 # Old experiments
 earnings_call_interpreter/src/old_experiments/**
 earnings_call_interpreter/src/evaluate/**

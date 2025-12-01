@@ -1,0 +1,118 @@
+########################################
+# OS / Editor
+########################################
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*.tmp
+
+########################################
+# Python
+########################################
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+.eggs/
+build/
+dist/
+.installed.cfg
+
+# Virtual envs
+.env
+.venv
+ENV/
+env/
+env.bak/
+pip-wheel-metadata/
+
+# Python tooling
+.pytest_cache/
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+########################################
+# IDE / Dev
+########################################
+.vscode/
+.idea/
+.settings/
+*.code-workspace
+*.log
+
+########################################
+# Jupyter
+########################################
+.ipynb_checkpoints/
+
+########################################
+# Model artifacts
+########################################
+*.pt
+*.pth
+*.h5
+*.joblib
+*.pickle
+*.pkl
+*.npz
+*.npy
+
+########################################
+# Vector DB / RAG generated artifacts
+########################################
+*.index
+*.faiss
+*.ann
+*.db
+*.sqlite
+*.sqlite3
+
+########################################
+# Credentials / Config
+########################################
+.env
+*.env
+secrets.json
+*.pem
+*.key
+*_credentials.*
+
+########################################
+# Electron / Node UI (if any)
+########################################
+node_modules/
+streamlit_static/
+
+########################################
+# ======================================
+# Project-specific ignores
+# ======================================
+########################################
+
+# ======================================
+# Earnings Call Interpreter
+# ======================================
+earnings_call_interpreter/data/chroma/
+earnings_call_interpreter/data/processed/checkpoint_processed_ids.txt
+
+# Ignore large processed datasets (keep corpus definitions)
+earnings_call_interpreter/data/**/*.parquet
+!earnings_call_interpreter/data/corpus/*.parquet  # <-- keep core input
+!earnings_call_interpreter/data/universe/*.parquet # <-- keep reference universe
+
+# Old experiments
+earnings_call_interpreter/src/old_experiments/**
+earnings_call_interpreter/src/evaluate/**
+
+# Local scripts / scratch
+earnings_call_interpreter/tmp/
+earnings_call_interpreter/**/tmp/
+earnings_call_interpreter/**/.cache/
+
+########################################
+# Keep SOURCE CODE ALWAYS
+########################################
+!earnings_call_interpreter/**/*.py

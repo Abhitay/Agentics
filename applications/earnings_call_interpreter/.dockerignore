@@ -1,41 +1,46 @@
-# Python
-__pycache__/
-*.py[cod]
-*$py.class
-*.so
-.Python
-
-# Virtual environments
-venv/
-env/
-ENV/
-.venv
-
-# IDEs
-.vscode/
-.idea/
+# --- OS / editor junk ---
+.DS_Store
+**/.DS_Store
 *.swp
 *.swo
+*.tmp
 
-# OS
-.DS_Store
-Thumbs.db
+# --- Python cache / build artifacts ---
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+.eggs/
+build/
+dist/
+.python-version
 
-# Git
-.git/
-.gitignore
-
-# Testing
-.pytest_cache/
-.coverage
-
-# Environment files
-.env
+# --- Virtual envs ---
+venv/
+.venv/
+env/
+.env.bak
 .env.local
 
-# Outputs
-visualizations/
+# --- Git & other VCS (even though you said no .gitignore, this is only for Docker) ---
+.git
+.gitignore
+.gitattributes
+
+# --- Notebooks, docs, experiments you don't need in the image ---
+docs/
+docs/notebook/
+src/evaluate/
+src/old_experiments/
+
+# --- Local tooling / configs not needed inside container ---
+.vscode/
+.idea/
 *.log
 
-# Notebooks / docs cache if any
-docs/**/.ipynb_checkpoints/
+# If you ever add large raw data or scratch dirs you don't want in the image, list them here.
+# For now I'm *not* excluding your current data/ because your app likely relies on those parquet files.
+# data/raw/
+# data/tmp/

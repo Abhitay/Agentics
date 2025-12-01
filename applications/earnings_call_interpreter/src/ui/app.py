@@ -34,8 +34,12 @@ from src.utils.quarters import normalize_quarter
 def _sanitize_text_for_pdf(text: str) -> str:
     """
     Replace common Unicode punctuation with simpler ASCII versions so that
-    PDF generation using latin-1 encoding doesn't crash.
+    PDF generation using latin-1 encoding doesn't crash, and strip basic
+    markdown artifacts that look ugly in PDFs.
     """
+    if not text:
+        return ""
+
     replacements = {
         "\u2013": "-",  # en dash
         "\u2014": "-",  # em dash
@@ -44,9 +48,28 @@ def _sanitize_text_for_pdf(text: str) -> str:
         "\u201c": '"',  # left double quote
         "\u201d": '"',  # right double quote
         "\u2022": "-",  # bullet
+        "•": "-",       # bullet literal
     }
     for bad, good in replacements.items():
         text = text.replace(bad, good)
+
+    # Strip simple markdown inline formatting
+    for md in ["**", "*", "`", "_"]:
+        text = text.replace(md, "")
+
+    return text
+
+
+def _strip_markdown_inline(text: str) -> str:
+    """
+    Strip inline markdown markers from a single logical sentence/phrase.
+    Used specifically for PDF content so it doesn't show **like this**.
+    """
+    if not text:
+        return ""
+    # Remove markdown emphasis and code markers
+    for md in ["**", "*", "`", "_"]:
+        text = text.replace(md, "")
     return text
 
 
@@ -87,7 +110,7 @@ def _parse_summary_sections(summary_md: str):
 
 def _create_summary_pdf(company: str, quarter: str, summary_md: str, tldr: str) -> bytes:
     """
-    Nicer single-page PDF:
+    Single-page PDF:
     - Title
     - TL;DR
     - Key Numbers
@@ -95,12 +118,13 @@ def _create_summary_pdf(company: str, quarter: str, summary_md: str, tldr: str) 
     - Guidance & Outlook
     - Risks & Watchpoints
 
-    Uses only plain ASCII so FPDF's latin-1 encoding never crashes.
+    Uses only plain ASCII so FPDF's latin-1 encoding doesn't crash.
+    Also strips markdown formatting so there is no backend syntax in the PDF.
     """
     if not HAS_FPDF:
         return b""
 
-    summary_md = _sanitize_text_for_pdf(summary_md)
+    summary_md = _sanitize_text_for_pdf(summary_md or "")
     tldr = _sanitize_text_for_pdf(tldr or "")
 
     snapshot_heading, sections = _parse_summary_sections(summary_md)
@@ -137,9 +161,14 @@ def _create_summary_pdf(company: str, quarter: str, summary_md: str, tldr: str) 
             stripped = line.strip()
             if not stripped:
                 continue
+
+            # Strip inline markdown from the content
+            stripped = _strip_markdown_inline(stripped)
+
             if stripped.startswith(("-", "*")):
                 # Markdown bullet -> normal ASCII dash bullet
                 content = stripped[1:].strip()
+                content = _strip_markdown_inline(content)
                 pdf.multi_cell(0, 6, f"- {content}")
             else:
                 pdf.multi_cell(0, 6, stripped)
@@ -159,7 +188,6 @@ def _create_summary_pdf(company: str, quarter: str, summary_md: str, tldr: str) 
     if isinstance(out, bytes):
         return out
     return out.encode("latin-1", "replace")
-
 
 
 def _render_summary_analytics(company: str, quarter: str, analytics: dict):
@@ -344,6 +372,12 @@ filing_type = "Earnings Call"  # currently only supporting earnings calls
 with tab_qna:
     st.subheader("Ask a question about this company's filings")
 
+    fast_qna = st.checkbox(
+        "Fast mode (skip smart planning step)",
+        value=True,
+        help="Faster but a bit less precise about which internal tools are used.",
+    )
+
     question = st.text_area(
         "Question",
         placeholder="e.g. What was total revenue? Did they raise or cut guidance?",
@@ -363,6 +397,7 @@ with tab_qna:
                     filing_type=filing_type,
                     quarter=quarter,
                     temperature=temperature,
+                    use_planner=not fast_qna,
                 )
 
             st.markdown("### Answer")
@@ -388,7 +423,32 @@ with tab_qna:
 with tab_summary:
     st.subheader("Generate an executive summary")
 
-    compare_prev = st.checkbox("Compare with previous quarter", value=True)
+    # All quarters for this company (latest first from AVAILABLE_QUARTERS)
+    company_quarters = AVAILABLE_QUARTERS.get(company, [])
+    comparison_choices = [q for q in company_quarters if q != quarter]
+
+    enable_compare = st.checkbox(
+        "Compare with another quarter",
+        value=False,
+        help="Turn on to compare this quarter's metrics against another one.",
+    )
+
+    comparison_quarter = None
+    if enable_compare and comparison_choices:
+        # Try to default to the chronologically previous quarter if it exists
+        default_idx = 0
+        if quarter in company_quarters:
+            current_idx = company_quarters.index(quarter)
+            if current_idx + 1 < len(company_quarters):
+                prev_q = company_quarters[current_idx + 1]
+                if prev_q in comparison_choices:
+                    default_idx = comparison_choices.index(prev_q)
+
+        comparison_quarter = st.selectbox(
+            "Quarter to compare against",
+            comparison_choices,
+            index=default_idx,
+        )
 
     if st.button("Generate summary"):
         if quarter is None:
@@ -400,7 +460,8 @@ with tab_summary:
                     filing_type=filing_type,
                     quarter=quarter,
                     temperature=temperature,
-                    compare_previous=compare_prev,
+                    compare_previous=False if comparison_quarter else True,
+                    compare_with=comparison_quarter,
                 )
 
             # Overview + sentiment/guidance/risk/focus

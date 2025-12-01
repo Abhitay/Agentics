@@ -31,7 +31,9 @@ def _call_llm(prompt: str, temperature: float = 0.2) -> str:
     response = client.models.generate_content(
         model=model_name,
         contents=prompt,
-        config={"temperature": temperature},
+        config={
+            "temperature": temperature
+        },
     )
     return response.text
 
@@ -311,12 +313,13 @@ def answer_question(
     filing_type: str,
     quarter: Optional[str],
     temperature: float = 0.2,
+    use_planner: bool = True,
 ) -> Tuple[str, List[Dict[str, Any]]]:
     """
-    Main Q&A entrypoint with a lightweight "agentic" planner.
+    Main Q&A entrypoint with optional "agentic" planner.
 
     Steps:
-    1) Ask a small planner LLM which sources we need.
+    1) Optionally ask a small planner LLM which sources we need (fast mode skips this).
     2) Call only those data sources.
     3) Feed the combined evidence into a final answer LLM call.
 
@@ -327,12 +330,24 @@ def answer_question(
         return "No quarter selected.", []
 
     # 1) PLAN
-    plan = _plan_question_tools(question)
-    use_vec = bool(plan.get("use_vector_search", True))
-    use_metrics = bool(plan.get("use_metrics", True))
-    use_segments = bool(plan.get("use_segments", True))
-    use_risks = bool(plan.get("use_risks", True))
-    vec_query = plan.get("vector_query") or question
+    if use_planner:
+        plan = _plan_question_tools(question)
+        use_vec = bool(plan.get("use_vector_search", True))
+        use_metrics = bool(plan.get("use_metrics", True))
+        use_segments = bool(plan.get("use_segments", True))
+        use_risks = bool(plan.get("use_risks", True))
+        vec_query = plan.get("vector_query") or question
+    else:
+        # FAST MODE: skip planner LLM call, just use everything
+        plan = {
+            "use_vector_search": True,
+            "use_metrics": True,
+            "use_segments": True,
+            "use_risks": True,
+            "vector_query": question,
+        }
+        use_vec = use_metrics = use_segments = use_risks = True
+        vec_query = question
 
     # 2) ACT – vector search
     vec_results: List[Dict[str, Any]] = []
@@ -342,7 +357,7 @@ def answer_question(
             company=company,
             filing_type=filing_type,
             quarter=quarter,
-            top_k=8,
+            top_k=4,  # reduced from 8 for speed
         )
 
     if vec_results:
@@ -671,6 +686,7 @@ def generate_summary(
     quarter: Optional[str],
     temperature: float = 0.2,
     compare_previous: bool = True,
+    compare_with: Optional[str] = None,
 ) -> Tuple[str, List[Dict[str, Any]], Dict[str, Any], str]:
     """
     Generate an executive summary of the company's earnings call.
@@ -680,6 +696,10 @@ def generate_summary(
     - Execution pulls only those sources.
     - We then compute analytics and TL;DR, and write a plain-English summary.
 
+    compare_with:
+        If provided, this specific quarter is used as the comparison baseline
+        instead of automatically picking the immediately previous quarter.
+
     Returns:
         summary_markdown, vector_sources, analytics_dict, tldr_string
     """
@@ -687,7 +707,11 @@ def generate_summary(
         return "No quarter selected.", [], {}, ""
 
     # 1) PLAN
-    plan = _plan_summary_tools(company, quarter, compare_previous)
+    plan = _plan_summary_tools(
+        company,
+        quarter,
+        compare_previous or bool(compare_with),
+    )
     use_vec = bool(plan.get("use_vector_search", True))
     use_metrics = bool(plan.get("use_metrics", True))
     use_segments = bool(plan.get("use_segments", True))
@@ -703,7 +727,7 @@ def generate_summary(
             company=company,
             filing_type=filing_type,
             quarter=quarter,
-            top_k=10,
+            top_k=5,  # reduced from 10
         )
 
     context = (
@@ -738,10 +762,31 @@ def generate_summary(
     else:
         current_metrics_json = []
 
-    # 2c) previous quarter metrics
+    # 2c) comparison quarter metrics (specific or previous)
     prev_quarter: Optional[str] = None
     prev_metrics_json: List[Dict[str, Any]] = []
-    if compare_previous and use_prev_q:
+
+    # If user picked a specific comparison quarter, that wins
+    if compare_with:
+        prev_quarter = compare_with
+        prev_df = get_company_quarter_metrics(company, prev_quarter)
+        if not prev_df.empty:
+            cols = [
+                "metric_name",
+                "metric_category",
+                "metric_value",
+                "metric_value_type",
+                "metric_unit",
+                "metric_currency",
+                "metric_direction",
+                "metric_is_guidance",
+                "metric_period",
+            ]
+            cols = [c for c in cols if c in prev_df.columns]
+            prev_metrics_json = prev_df[cols].to_dict(orient="records")
+
+    # Otherwise fall back to automatically using the previous quarter
+    elif compare_previous and use_prev_q:
         prev_quarter = get_previous_quarter(company, quarter)
         if prev_quarter:
             prev_df = get_company_quarter_metrics(company, prev_quarter)
@@ -960,7 +1005,7 @@ def benchmark_peers(
             company=c,
             filing_type=filing_type,
             quarter=quarter,
-            top_k=6,
+            top_k=3,  # reduced from 6
         )
 
         snippets = [r.get("text", "") for r in vec_results]

@@ -1,5 +1,5 @@
-streamlit
-pandas
+streamlit>=1.31.0
+pandas>=2.0.0
 numpy
 requests
 pydantic
@@ -18,3 +18,4 @@ google-genai
 wrds
 ollama
 fpdf
+docker
